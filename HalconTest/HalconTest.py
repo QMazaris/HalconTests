@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 from typing import Optional
+import logging
 
 from mcp.server.fastmcp import FastMCP
 from rapidfuzz import process, fuzz
@@ -10,12 +11,33 @@ DB_PATH = Path(__file__).with_name("halcon_operators.db")
 # Create the FastMCP server
 mcp = FastMCP("halcon-mcp-server")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
 
 def get_connection():
     """Get database connection."""
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
+
+
+def validate_database() -> None:
+    """Validate database connectivity and log basic stats."""
+    if not DB_PATH.exists():
+        logging.error("Database file not found at %s", DB_PATH)
+        raise FileNotFoundError(f"Database not found: {DB_PATH}")
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.cursor()
+        count = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
+        logging.info("Database connected: %d operators available", count)
+    except Exception as exc:
+        logging.exception("Failed to query database: %s", exc)
+        raise
+    finally:
+        con.close()
 
 
 @mcp.resource("halcon://operators")
@@ -181,4 +203,7 @@ def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run() 
+    logging.info("Starting HALCON MCP server …")
+    validate_database()
+    logging.info("Launching FastMCP (transport=stdio)…")
+    mcp.run(transport="stdio") 
