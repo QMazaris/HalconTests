@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "halcon": {
+      "command": "python",
+      "args": ["C:\\Users\\QuinnMazaris\\Documents\\HalconTests\\mcp_server.py"],
+      "env": {
+        "PYTHONPATH": "C:\\Users\\QuinnMazaris\\Documents\\HalconTests\\.venv\\Lib\\site-packages"
+      }
+    }
+  }
+} 
