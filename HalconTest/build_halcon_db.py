@@ -56,7 +56,8 @@ def discover_all_operators(verbose: bool = False) -> dict[str, str]:
         
         # Merge ops, preferring newer versions for duplicates
         for name, op_url in ops.items():
-            if name not in all_ops or key == "dl1905":  # Prefer DL version if duplicate
+            # Prefer newer versions for duplicates: dl1905 > h1811 > h12
+            if name not in all_ops or key in {"dl1905", "h1811"}:
                 all_ops[name] = op_url
     
     print(f"Total unique operators discovered: {len(all_ops)}")
@@ -122,9 +123,10 @@ def main():
     parser = argparse.ArgumentParser(description="Build HALCON operators database")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output")
+    parser.add_argument("-o", "--output", default="halcon_operators.db", help="Output SQLite DB filename")
     args = parser.parse_args()
     
-    db_path = Path("halcon_operators.db")
+    db_path = Path(args.output)
     
     try:
         # Step 1: Create database

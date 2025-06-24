@@ -1,12 +1,13 @@
 import sqlite3
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal
 import logging
 
 from mcp.server.fastmcp import FastMCP
 from rapidfuzz import process, fuzz
 
-DB_PATH = Path(__file__).with_name("halcon_operators.db")
+DB_PATH = Path(os.getenv("HALCON_DB_PATH", Path(__file__).with_name("halcon_operators_new.db")))
 
 # Create the FastMCP server
 mcp = FastMCP("halcon-mcp-server")
@@ -69,26 +70,12 @@ def get_operators_info() -> str:
 def search_halcon_operators(query: str, limit: int = 10) -> str:
     """Search HALCON operators by name or functionality.
 
-    Use this tool when you need to find HALCON operators that match a search term.
-    This performs fuzzy matching on both operator names and descriptions, so you can search
-    for partial names, functionality keywords, or general concepts.
-
     Args:
-        query: Search term for HALCON operator name or functionality. Can be:
-               - Partial operator name (e.g., "read_image" to find "read_image")
-               - Functionality keyword (e.g., "morphology", "filter", "blob")
-               - General concept (e.g., "image processing", "measurement")
-        limit: Maximum number of results to return (default: 10, max recommended: 20)
+        query: Search term for operator name or functionality
+        limit: Maximum number of results (default: 10, max: 20)
 
     Returns:
-        Formatted list of matching HALCON operators with similarity scores.
-        Each result includes the operator name, description preview, and match percentage.
-        Returns "No HALCON operators found..." if no matches above 30% similarity.
-
-    Example usage:
-        - To find image reading functions: query="read image"
-        - To find morphological operations: query="morphology"
-        - To find a specific operator: query="threshold"
+        Formatted list of matching operators with similarity scores.
     """
     con = get_connection()
     try:
@@ -135,137 +122,63 @@ def search_halcon_operators(query: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
-def get_halcon_operator_info(name: str) -> str:
-    """Get essential information about a specific HALCON operator (name, signature, description).
-
-    Use this tool when you need the key information about a HALCON operator without 
-    the full page dump. This is more efficient and concise than the full page dump.
+def get_halcon_operator(name: str, detail: Literal["signature", "info", "full"] = "info") -> str:
+    """Get HALCON operator information with different levels of detail.
 
     Args:
-        name: Exact name of the HALCON operator (case-insensitive).
-              Must be the precise operator name as it appears in HALCON documentation.
-              Examples: "read_image", "threshold", "connection", "select_shape"
+        name: Exact name of the HALCON operator (case-insensitive)
+        detail: Level of detail to return:
+                - "signature": Just the function signature/syntax
+                - "info": Name, signature, description, and URL (default)
+                - "full": Complete documentation including full page dump
 
     Returns:
-        Essential operator information including:
-        - Operator name (formatted)
-        - Signature/syntax
-        - Full description
-        - Official documentation URL
-
-    Returns "HALCON operator 'name' not found" if the operator doesn't exist.
-
-    Example usage:
-        - name="read_image" (gets essential info about the image reading operator)
-        - name="threshold" (gets essential info about the thresholding operator)
+        Operator information formatted according to detail level.
     """
     con = get_connection()
     try:
         cur = con.cursor()
+        
+        # Select fields based on detail level
+        if detail == "signature":
+            fields = "name, signature"
+        elif detail == "full":
+            fields = "name, signature, description, page_dump, url"
+        else:  # info
+            fields = "name, signature, description, url"
+        
         row = cur.execute(
-            "SELECT name, signature, description, url FROM operators WHERE name = ? COLLATE NOCASE", 
+            f"SELECT {fields} FROM operators WHERE name = ? COLLATE NOCASE", 
             (name,)
         ).fetchone()
         
         if not row:
             return f"HALCON operator '{name}' not found"
         
-        result_text = f"**{row['name']}**\n\n"
+        # Format response based on detail level
+        if detail == "signature":
+            if row['signature']:
+                return f"**{row['name']}** signature:\n```\n{row['signature']}\n```"
+            else:
+                return f"**{row['name']}**: No signature available"
         
-        if row['signature']:
-            result_text += f"**Signature:**\n```\n{row['signature']}\n```\n\n"
+        elif detail == "full":
+            result_text = f"**{row['name']} - Complete Documentation**\n\n"
+            if row['signature']:
+                result_text += f"**Signature:**\n```\n{row['signature']}\n```\n\n"
+            result_text += f"**Description:**\n{row['description'] or 'No description available'}\n\n"
+            result_text += f"**Source:** {row['url']}\n\n"
+            result_text += "**Full Documentation Content:**\n\n"
+            result_text += row['page_dump'] or 'No page dump available'
+            return result_text
         
-        result_text += f"**Description:**\n{row['description'] or 'No description available'}\n\n"
-        result_text += f"**Documentation URL:**\n{row['url']}\n"
-        
-        return result_text
-        
-    finally:
-        con.close()
-
-
-@mcp.tool()
-def get_halcon_operator_signature(name: str) -> str:
-    """Get just the signature/syntax of a specific HALCON operator.
-
-    Use this tool when you only need the function signature without description or other details.
-    This is very lightweight and suitable for quick syntax lookups or when making many calls
-    to avoid filling the context window.
-
-    Args:
-        name: Exact name of the HALCON operator (case-insensitive).
-              Must be the precise operator name as it appears in HALCON documentation.
-              Examples: "read_image", "threshold", "connection", "select_shape"
-
-    Returns:
-        Just the operator signature/syntax, or "No signature available" if not found.
-
-    Example usage:
-        - name="read_image" (gets just the signature)
-        - name="threshold" (gets just the signature)
-    """
-    con = get_connection()
-    try:
-        cur = con.cursor()
-        row = cur.execute(
-            "SELECT name, signature FROM operators WHERE name = ? COLLATE NOCASE", 
-            (name,)
-        ).fetchone()
-        
-        if not row:
-            return f"HALCON operator '{name}' not found"
-        
-        if row['signature']:
-            return f"**{row['name']}** signature:\n```\n{row['signature']}\n```"
-        else:
-            return f"**{row['name']}**: No signature available"
-        
-    finally:
-        con.close()
-
-
-@mcp.tool()
-def get_halcon_operator_page_dump(name: str) -> str:
-    """Get the complete page dump for a specific HALCON operator.
-
-    Use this tool when you need the complete documentation content for a HALCON operator,
-    including all details, examples, and technical information. This provides the most
-    comprehensive information but can be quite large.
-
-    Args:
-        name: Exact name of the HALCON operator (case-insensitive).
-              Must be the precise operator name as it appears in HALCON documentation.
-              Examples: "read_image", "threshold", "connection", "select_shape"
-
-    Returns:
-        Complete operator documentation content including:
-        - Full page text dump from the official documentation
-        - All technical details, parameters, examples
-        - Note: This can be quite large (several KB of text)
-
-    Returns "HALCON operator 'name' not found" if the operator doesn't exist.
-
-    Example usage:
-        - name="read_image" (gets complete documentation)
-        - name="threshold" (gets complete documentation)
-    """
-    con = get_connection()
-    try:
-        cur = con.cursor()
-        row = cur.execute(
-            "SELECT name, page_dump, url FROM operators WHERE name = ? COLLATE NOCASE", 
-            (name,)
-        ).fetchone()
-        
-        if not row:
-            return f"HALCON operator '{name}' not found"
-        
-        result_text = f"**{row['name']} - Complete Documentation**\n\n"
-        result_text += f"**Source:** {row['url']}\n\n"
-        result_text += "**Full Documentation Content:**\n\n"
-        result_text += row['page_dump'] or 'No page dump available'
-        
-        return result_text
+        else:  # info
+            result_text = f"**{row['name']}**\n\n"
+            if row['signature']:
+                result_text += f"**Signature:**\n```\n{row['signature']}\n```\n\n"
+            result_text += f"**Description:**\n{row['description'] or 'No description available'}\n\n"
+            result_text += f"**Documentation URL:**\n{row['url']}\n"
+            return result_text
         
     finally:
         con.close()
@@ -275,26 +188,12 @@ def get_halcon_operator_page_dump(name: str) -> str:
 def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
     """List HALCON operators with pagination.
 
-    Use this tool to browse through the available HALCON operators in alphabetical order.
-    This is useful for discovering operators or getting an overview of what's available.
-    For searching specific functionality, use search_halcon_operators instead.
-
     Args:
-        offset: Number of results to skip (default: 0). Use for pagination.
-                Examples: 0 (first page), 50 (second page), 100 (third page)
-        limit: Maximum number of results to return (default: 50, max recommended: 100).
-               Larger values may result in very long responses.
+        offset: Number of results to skip (default: 0)
+        limit: Maximum results to return (default: 50, max: 100)
 
     Returns:
-        Paginated list of HALCON operators showing:
-        - Current page info (showing X-Y of total)
-        - Operator names in alphabetical order
-        - Brief description for each operator (if available)
-
-    Example usage:
-        - offset=0, limit=20 (first 20 operators)
-        - offset=50, limit=25 (operators 51-75)
-        - offset=0, limit=100 (first 100 operators for broad overview)
+        Paginated list of operators with brief descriptions.
     """
     con = get_connection()
     try:

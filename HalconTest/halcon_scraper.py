@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 BASE_URL = "https://www.mvtec.com/doc/halcon/11/en/"
 INDEX_RELATIVE = "index_by_name.html"
-DB_PATH = Path(__file__).with_name("halcon_operators.db")
+DB_PATH = Path(__file__).with_name("halcon_operators2.db")
 
 
 def ensure_database(db_path: Path) -> sqlite3.Connection:

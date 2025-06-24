@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 
 ROOTS = {
     "h12":    "https://www.mvtec.com/doc/halcon/12/en/index.html",
+    "h1811":  "https://www.mvtec.com/doc/halcon/1811/en/index.html",  # HALCON 18.11 classic reference
     "dl1905": "https://www.mvtec.com/doc/halcon/1905/en/toc_deeplearning.html",
 }
 UA       = {"User-Agent": "HalconScraper/0.3 (+https://example.com)"}
