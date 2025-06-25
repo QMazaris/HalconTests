@@ -2,5 +2,33 @@
   {
     "type": "sqlite",
     "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\halcon_code_examples.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\halcon_operators_v3.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\halcon_operators_local.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\utils\\halcon_operators_v3.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\utils\\combined.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\utils\\combinedV1.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\utils\\combined_1750864771.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\halcon_code_examplesV2.db"
   }
 ]

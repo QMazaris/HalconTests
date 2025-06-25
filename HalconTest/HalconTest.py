@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import pickle
 from pathlib import Path
 from typing import Literal
 import logging
@@ -10,9 +11,15 @@ from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 from rapidfuzz import process, fuzz
 
-DB_PATH = Path(os.getenv("HALCON_DB_PATH", Path(__file__).with_name("halcon_operators_new.db")))
+DB_PATH = Path(os.getenv("HALCON_DB_PATH", Path(__file__).with_name("combined.db")))
 # New: path to the code examples database (populated via chunk_scanner_cli.py)
-CODE_DB_PATH = Path(os.getenv("HALCON_CODE_DB_PATH", Path(__file__).with_name("halcon_code_examples.db")))
+CODE_DB_PATH = Path(os.getenv("HALCON_CODE_DB_PATH", Path(__file__).with_name("halcon_code_examplesV2.db")))
+
+# Pre-built index paths
+OPERATOR_INDEX_PATH = Path(__file__).with_name("halcon_operators.faiss")
+OPERATOR_META_PATH = Path(__file__).with_name("halcon_operators_meta.pkl")
+CODE_INDEX_PATH = Path(__file__).with_name("halcon_code_examples.faiss")
+CODE_META_PATH = Path(__file__).with_name("halcon_code_examples_meta.pkl")
 
 # Create the FastMCP server
 mcp = FastMCP("halcon-mcp-server")
@@ -50,7 +57,7 @@ def validate_database() -> None:
         # Check if we have the new schema
         columns = cur.execute("PRAGMA table_info(operators)").fetchall()
         col_names = [col[1] for col in columns]
-        required_cols = ['name', 'signature', 'description', 'page_dump', 'url']
+        required_cols = ['name', 'signature', 'description', 'parameters', 'results', 'url']
         
         for col in required_cols:
             if col not in col_names:
@@ -155,7 +162,7 @@ def get_halcon_operator(name: str, detail: Literal["signature", "info", "full"] 
         if detail == "signature":
             fields = "name, signature"
         elif detail == "full":
-            fields = "name, signature, description, page_dump, url"
+            fields = "name, signature, description, url"
         else:  # info
             fields = "name, signature, description, url"
         
@@ -179,9 +186,7 @@ def get_halcon_operator(name: str, detail: Literal["signature", "info", "full"] 
             if row['signature']:
                 result_text += f"**Signature:**\n```\n{row['signature']}\n```\n\n"
             result_text += f"**Description:**\n{row['description'] or 'No description available'}\n\n"
-            result_text += f"**Source:** {row['url']}\n\n"
-            result_text += "**Full Documentation Content:**\n\n"
-            result_text += row['page_dump'] or 'No page dump available'
+            result_text += f"**Source:** {row['url']}\n"
             return result_text
         
         else:  # info
@@ -235,28 +240,50 @@ def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
 
 # Configuration constants
 SEMANTIC_MODEL_NAME = os.getenv("HALCON_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-_EMBED_TEXT_MAX_CHARS = 2000  # Max characters taken from page_dump when description missing
 _TOP_K_DEFAULT = 5
 
-# Lazy-initialised globals
-_embedding_model: SentenceTransformer | None = None
-_faiss_index: faiss.IndexFlatIP | None = None
-_operator_meta: list[dict] | None = None
-# New: lazy-initialised globals for code examples semantic index
-_code_index: faiss.IndexFlatIP | None = None
-_code_meta: list[dict] | None = None
+# Quantization settings for performance
+USE_QUANTIZATION = True  # Set to False for exact search, True for faster approximate search
+QUANTIZATION_BITS = 8    # 8-bit quantization for good speed/accuracy tradeoff
+NPROBE = 16             # Number of clusters to search (higher = more accurate but slower)
+
+# Global variables for semantic search
+_embedding_model = None
+_faiss_index = None
+_operator_meta = None
+_code_index = None
+_code_meta = None
 
 
 def _ensure_semantic_index() -> None:
-    """Build the FAISS index with operator embeddings on first use."""
+    """Load or build the FAISS index with operator embeddings."""
     global _embedding_model, _faiss_index, _operator_meta
 
     if _faiss_index is not None:
-        return  # Already built
+        return  # Already loaded
 
-    logging.info("Building semantic embedding index for HALCON operators …")
+    # Try to load pre-built index first
+    if OPERATOR_INDEX_PATH.exists() and OPERATOR_META_PATH.exists():
+        logging.info("Loading pre-built semantic index for HALCON operators...")
+        try:
+            _faiss_index = faiss.read_index(str(OPERATOR_INDEX_PATH))
+            with open(OPERATOR_META_PATH, 'rb') as f:
+                _operator_meta = pickle.load(f)
+            
+            # Load embedding model for query encoding
+            _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+            
+            # Set nprobe for quantized indices
+            if hasattr(_faiss_index, 'nprobe'):
+                _faiss_index.nprobe = NPROBE
+                
+            logging.info("Pre-built index loaded with %d operator embeddings", len(_operator_meta))
+            return
+        except Exception as e:
+            logging.warning("Failed to load pre-built index, rebuilding: %s", e)
 
-    # Load embedding model
+    # Build index from scratch
+    logging.info("Building semantic embedding index for HALCON operators...")
     _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
 
     # Fetch operator data
@@ -264,14 +291,14 @@ def _ensure_semantic_index() -> None:
     try:
         cur = con.cursor()
         rows = cur.execute(
-            "SELECT name, description, page_dump, signature, url FROM operators"
+            "SELECT name, description, signature, url FROM operators"
         ).fetchall()
 
         texts: list[str] = []
         _operator_meta = []
 
         for row in rows:
-            text = row["description"] if row["description"] else row["page_dump"][:_EMBED_TEXT_MAX_CHARS]
+            text = row["description"] or "No description available"
             texts.append(text)
             _operator_meta.append(
                 {
@@ -279,23 +306,36 @@ def _ensure_semantic_index() -> None:
                     "description": row["description"] or "No description available",
                     "signature": row["signature"],
                     "url": row["url"],
-                    "page_dump": row["page_dump"],
                 }
             )
     finally:
         con.close()
 
-    # Compute embeddings and build FAISS index (cosine similarity via dot-product on normalised vectors)
+    # Compute embeddings
     embeddings = _embedding_model.encode(
         texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True
     )
 
-    # Normalise to unit length for cosine similarity
+    # Normalize to unit length for cosine similarity
     embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
 
     dim = embeddings.shape[1]
-    _faiss_index = faiss.IndexFlatIP(dim)
-    _faiss_index.add(embeddings.astype(np.float32))
+    n_vectors = len(embeddings)
+
+    # Create optimized index based on dataset size and settings
+    if USE_QUANTIZATION and n_vectors > 1000:
+        # Use IVF (Inverted File) with inner product for cosine similarity on normalized vectors
+        n_centroids = min(max(int(np.sqrt(n_vectors)), 100), n_vectors // 10)
+        _faiss_index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, n_centroids, faiss.METRIC_INNER_PRODUCT)
+        _faiss_index.train(embeddings.astype(np.float32))
+        _faiss_index.add(embeddings.astype(np.float32))
+        _faiss_index.nprobe = NPROBE
+        logging.info("Built quantized IVF index with %d centroids", n_centroids)
+    else:
+        # Use flat index for small datasets or exact search
+        _faiss_index = faiss.IndexFlatIP(dim)
+        _faiss_index.add(embeddings.astype(np.float32))
+        logging.info("Built flat index for exact search")
 
     logging.info("Semantic index built with %d operator embeddings", len(texts))
 
@@ -305,13 +345,35 @@ def _ensure_semantic_index() -> None:
 # ------------------------------------------------------------
 
 def _ensure_code_index() -> None:
-    """Build the FAISS index with embeddings of code examples on first use."""
+    """Load or build the FAISS index with embeddings of code examples."""
     global _embedding_model, _code_index, _code_meta
 
     if _code_index is not None:
-        return  # Already built
+        return  # Already loaded
 
-    logging.info("Building semantic embedding index for HALCON code examples …")
+    # Try to load pre-built index first
+    if CODE_INDEX_PATH.exists() and CODE_META_PATH.exists():
+        logging.info("Loading pre-built semantic index for HALCON code examples...")
+        try:
+            _code_index = faiss.read_index(str(CODE_INDEX_PATH))
+            with open(CODE_META_PATH, 'rb') as f:
+                _code_meta = pickle.load(f)
+            
+            # Load embedding model for query encoding (reuse if already loaded)
+            if _embedding_model is None:
+                _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+            
+            # Set nprobe for quantized indices
+            if hasattr(_code_index, 'nprobe'):
+                _code_index.nprobe = NPROBE
+                
+            logging.info("Pre-built code index loaded with %d example embeddings", len(_code_meta))
+            return
+        except Exception as e:
+            logging.warning("Failed to load pre-built code index, rebuilding: %s", e)
+
+    # Build index from scratch
+    logging.info("Building semantic embedding index for HALCON code examples...")
 
     # Load embedding model (reuse if already loaded)
     if _embedding_model is None:
@@ -329,8 +391,8 @@ def _ensure_code_index() -> None:
         _code_meta = []
 
         for row in rows:
-            # Combine available textual fields for embedding. We truncate long code blocks.
-            text_parts = [row["title"] or "", row["description"] or "", row["code"][:_EMBED_TEXT_MAX_CHARS]]
+            # Combine available textual fields for embedding, excluding code content
+            text_parts = [row["title"] or "", row["description"] or ""]
             texts.append(" ".join(text_parts))
             _code_meta.append(
                 {
@@ -343,15 +405,29 @@ def _ensure_code_index() -> None:
     finally:
         con.close()
 
-    # Compute embeddings and build FAISS index (cosine similarity via dot-product on unit vectors)
+    # Compute embeddings
     embeddings = _embedding_model.encode(
         texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True
     )
     embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
 
     dim = embeddings.shape[1]
-    _code_index = faiss.IndexFlatIP(dim)
-    _code_index.add(embeddings.astype(np.float32))
+    n_vectors = len(embeddings)
+
+    # Create optimized index based on dataset size and settings
+    if USE_QUANTIZATION and n_vectors > 500:
+        # Use IVF for code examples (smaller dataset, fewer centroids)
+        n_centroids = min(max(int(np.sqrt(n_vectors)), 50), n_vectors // 5)
+        _code_index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, n_centroids, faiss.METRIC_INNER_PRODUCT)
+        _code_index.train(embeddings.astype(np.float32))
+        _code_index.add(embeddings.astype(np.float32))
+        _code_index.nprobe = NPROBE
+        logging.info("Built quantized code index with %d centroids", n_centroids)
+    else:
+        # Use flat index for small datasets
+        _code_index = faiss.IndexFlatIP(dim)
+        _code_index.add(embeddings.astype(np.float32))
+        logging.info("Built flat code index for exact search")
 
     logging.info("Semantic index built with %d code example embeddings", len(texts))
 
@@ -405,7 +481,6 @@ def semantic_match(
                     "signature": meta["signature"],
                     "description": meta["description"],
                     "url": meta["url"],
-                    "page_dump": meta["page_dump"],
                 }
             )
         else:  # info (default)
