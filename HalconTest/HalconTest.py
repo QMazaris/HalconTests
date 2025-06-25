@@ -11,6 +11,8 @@ from mcp.server.fastmcp import FastMCP
 from rapidfuzz import process, fuzz
 
 DB_PATH = Path(os.getenv("HALCON_DB_PATH", Path(__file__).with_name("halcon_operators_new.db")))
+# New: path to the code examples database (populated via chunk_scanner_cli.py)
+CODE_DB_PATH = Path(os.getenv("HALCON_CODE_DB_PATH", Path(__file__).with_name("halcon_code_examples.db")))
 
 # Create the FastMCP server
 mcp = FastMCP("halcon-mcp-server")
@@ -22,6 +24,13 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 def get_connection():
     """Get database connection."""
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def get_code_con():
+    """Return SQLite connection to the HALCON code examples database."""
+    con = sqlite3.connect(CODE_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
@@ -233,6 +242,9 @@ _TOP_K_DEFAULT = 5
 _embedding_model: SentenceTransformer | None = None
 _faiss_index: faiss.IndexFlatIP | None = None
 _operator_meta: list[dict] | None = None
+# New: lazy-initialised globals for code examples semantic index
+_code_index: faiss.IndexFlatIP | None = None
+_code_meta: list[dict] | None = None
 
 
 def _ensure_semantic_index() -> None:
@@ -286,6 +298,62 @@ def _ensure_semantic_index() -> None:
     _faiss_index.add(embeddings.astype(np.float32))
 
     logging.info("Semantic index built with %d operator embeddings", len(texts))
+
+
+# ------------------------------------------------------------
+# Semantic code example matching (internal helper)
+# ------------------------------------------------------------
+
+def _ensure_code_index() -> None:
+    """Build the FAISS index with embeddings of code examples on first use."""
+    global _embedding_model, _code_index, _code_meta
+
+    if _code_index is not None:
+        return  # Already built
+
+    logging.info("Building semantic embedding index for HALCON code examples …")
+
+    # Load embedding model (reuse if already loaded)
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+
+    # Fetch code example data
+    con = get_code_con()
+    try:
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT title, description, code, tags FROM examples"
+        ).fetchall()
+
+        texts: list[str] = []
+        _code_meta = []
+
+        for row in rows:
+            # Combine available textual fields for embedding. We truncate long code blocks.
+            text_parts = [row["title"] or "", row["description"] or "", row["code"][:_EMBED_TEXT_MAX_CHARS]]
+            texts.append(" ".join(text_parts))
+            _code_meta.append(
+                {
+                    "title": row["title"],
+                    "description": row["description"],
+                    "code": row["code"],
+                    "tags": row["tags"],
+                }
+            )
+    finally:
+        con.close()
+
+    # Compute embeddings and build FAISS index (cosine similarity via dot-product on unit vectors)
+    embeddings = _embedding_model.encode(
+        texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True
+    )
+    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+    dim = embeddings.shape[1]
+    _code_index = faiss.IndexFlatIP(dim)
+    _code_index.add(embeddings.astype(np.float32))
+
+    logging.info("Semantic index built with %d code example embeddings", len(texts))
 
 
 @mcp.tool()
@@ -350,6 +418,42 @@ def semantic_match(
             )
 
         results.append(op)
+
+    return results
+
+
+@mcp.tool()
+def semantic_code_search(
+    query: str,
+    k: int = _TOP_K_DEFAULT,
+) -> list[dict]:
+    """Return top-k code example chunks matching a natural language query.
+
+    Each result contains title, description, tags, full code, and similarity score.
+    """
+
+    if not query or len(query.strip()) < 3:
+        return []
+
+    _ensure_code_index()
+
+    vec = _embedding_model.encode([query], convert_to_numpy=True)
+    vec = vec / np.linalg.norm(vec)
+
+    D, I = _code_index.search(vec.astype(np.float32), k)
+
+    results = []
+    for idx, score in zip(I[0], D[0]):
+        if idx < 0:
+            continue
+        meta = _code_meta[idx]
+        results.append({
+            "title": meta["title"],
+            "description": meta["description"],
+            "tags": meta["tags"],
+            "code": meta["code"],
+            "score": float(score),
+        })
 
     return results
 
