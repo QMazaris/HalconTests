@@ -65,31 +65,59 @@ def get_code_connection():
 
 
 def validate_database() -> None:
-    """Validate database connectivity and log basic stats."""
+    """Validate database connectivity and log basic stats for both operators and code examples."""
+    # Validate Operator Database
     if not DB_PATH.exists():
-        logging.error("Database file not found at %s", DB_PATH)
-        raise FileNotFoundError(f"Database not found: {DB_PATH}")
+        logging.error("Operator database file not found at %s", DB_PATH)
+        raise FileNotFoundError(f"Operator database not found: {DB_PATH}")
 
     with get_connection() as con:
         try:
             cur = con.cursor()
             count = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
-            logging.info("Database connected: %d operators available", count)
-            
-            # Check if we have the new schema
+            logging.info("Operator database connected: %d operators available", count)
+
+            # Check schema
             columns = cur.execute("PRAGMA table_info(operators)").fetchall()
             col_names = [col[1] for col in columns]
             required_cols = ['name', 'signature', 'description', 'parameters', 'results', 'url']
-            
+
             for col in required_cols:
                 if col not in col_names:
-                    logging.error("Missing required column: %s", col)
+                    logging.error("Missing required column in operators table: %s", col)
+                    raise ValueError(f"Database schema missing column: {col}")
+
+            logging.info("Operator database schema validated successfully")
+
+        except Exception as exc:
+            logging.exception("Failed to query operator database: %s", exc)
+            raise
+
+    # Validate Code Examples Database
+    if not CODE_DB_PATH.exists():
+        logging.error("Code examples database file not found at %s", CODE_DB_PATH)
+        raise FileNotFoundError(f"Code examples database not found: {CODE_DB_PATH}")
+
+    with get_code_connection() as con:
+        try:
+            cur = con.cursor()
+            count = cur.execute("SELECT COUNT(*) FROM examples").fetchone()[0]
+            logging.info("Code examples database connected: %d examples available", count)
+
+            # Check schema
+            columns = cur.execute("PRAGMA table_info(examples)").fetchall()
+            col_names = [col[1] for col in columns]
+            required_cols = ['title', 'description', 'code', 'tags']
+
+            for col in required_cols:
+                if col not in col_names:
+                    logging.error("Missing required column in examples table: %s", col)
                     raise ValueError(f"Database schema missing column: {col}")
             
-            logging.info("Database schema validated successfully")
-            
+            logging.info("Code examples database schema validated successfully")
+
         except Exception as exc:
-            logging.exception("Failed to query database: %s", exc)
+            logging.exception("Failed to query code examples database: %s", exc)
             raise
 
 
@@ -187,6 +215,16 @@ def _ensure_semantic_index() -> None:
     _faiss_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
     logging.info("Semantic index built with %d operator embeddings", len(texts))
 
+    # Save index for future runs
+    try:
+        logging.info("Saving semantic index for operators to %s", OPERATOR_INDEX_PATH)
+        faiss.write_index(_faiss_index, str(OPERATOR_INDEX_PATH))
+        with open(OPERATOR_META_PATH, 'wb') as f:
+            pickle.dump(_operator_meta, f)
+        logging.info("Operator index saved successfully.")
+    except Exception as e:
+        logging.warning("Could not save operator index: %s", e)
+
 
 def _ensure_code_index() -> None:
     """Load or build the FAISS index with embeddings of code examples."""
@@ -229,9 +267,14 @@ def _ensure_code_index() -> None:
         _code_meta = []
 
         for row in rows:
-            # Combine available textual fields for embedding, excluding code content
-            text_parts = [row["title"] or "", row["description"] or ""]
-            texts.append(" ".join(text_parts))
+            # Combine available textual fields for embedding, including a code snippet
+            code_snippet = (row["code"] or "")[:256]
+            text_parts = [
+                row["title"] or "",
+                row["description"] or "",
+                code_snippet,
+            ]
+            texts.append(" ".join(text_parts).strip())
             _code_meta.append(
                 {
                     "title": row["title"],
@@ -249,6 +292,16 @@ def _ensure_code_index() -> None:
 
     _code_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
     logging.info("Semantic index built with %d code example embeddings", len(texts))
+
+    # Save index for future runs
+    try:
+        logging.info("Saving semantic index for code examples to %s", CODE_INDEX_PATH)
+        faiss.write_index(_code_index, str(CODE_INDEX_PATH))
+        with open(CODE_META_PATH, 'wb') as f:
+            pickle.dump(_code_meta, f)
+        logging.info("Code example index saved successfully.")
+    except Exception as e:
+        logging.warning("Could not save code example index: %s", e)
 
 
 @mcp.resource("halcon://operators")
