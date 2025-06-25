@@ -92,7 +92,7 @@ def discover(root_name: str, entry_url: str, verbose: bool=False) -> dict[str,st
             filename = os.path.basename(path)
             if "/operators/" in path or OP_PAT.match(filename):
                 name = os.path.splitext(filename.lower())[0]
-                if name and name not in ops:
+                if name and name not in ops and not name.startswith("toc_"):
                     ops[name] = href
                     log(f"    + op {name}", "OP", verbose)
 

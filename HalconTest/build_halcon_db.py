@@ -3,7 +3,7 @@
 build_halcon_db.py
 
 Combines operator discovery and data extraction to build a complete
-HALCON operators database with name, signature, description, and page_dump.
+HALCON operators database with name, signature, description, parameters, and results.
 
 Usage:
     python build_halcon_db.py [-v]
@@ -35,7 +35,8 @@ def create_database(db_path: Path) -> None:
                 name TEXT PRIMARY KEY,
                 signature TEXT,
                 description TEXT,
-                page_dump TEXT,
+                parameters TEXT,
+                results TEXT,
                 url TEXT
             )
         """)
@@ -91,13 +92,14 @@ def extract_and_store_operators(operators: dict[str, str], db_path: Path, verbos
                 # Store in database
                 cur.execute("""
                     INSERT OR REPLACE INTO operators 
-                    (name, signature, description, page_dump, url)
-                    VALUES (?, ?, ?, ?, ?)
+                    (name, signature, description, parameters, results, url)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """, (
                     data["name"],
                     data["signature"],
                     data["description"],
-                    data["page_dump"],
+                    data["parameters"],
+                    data["results"],
                     url
                 ))
                 
@@ -123,7 +125,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build HALCON operators database")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output")
-    parser.add_argument("-o", "--output", default="halcon_operators.db", help="Output SQLite DB filename")
+    parser.add_argument("-o", "--output", default="halcon_operators_v3.db", help="Output SQLite DB filename")
     args = parser.parse_args()
     
     db_path = Path(args.output)
@@ -154,7 +156,8 @@ def main():
                 SELECT name, 
                        LENGTH(signature) as sig_len,
                        LENGTH(description) as desc_len, 
-                       LENGTH(page_dump) as dump_len
+                       LENGTH(parameters) as param_len,
+                       LENGTH(results) as res_len
                 FROM operators 
                 ORDER BY name 
                 LIMIT 5
@@ -162,7 +165,7 @@ def main():
             
             print("\nSample entries:")
             for row in sample:
-                print(f"  {row[0]}: sig={row[1]} chars, desc={row[2]} chars, dump={row[3]} chars")
+                print(f"  {row[0]}: sig={row[1]} chars, desc={row[2]} chars, param={row[3]} chars, res={row[4]} chars")
                 
         finally:
             con.close()

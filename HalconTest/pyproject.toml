@@ -7,6 +7,9 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.9.4",
     "rapidfuzz>=3.13.0",
+    "sentence-transformers>=2.2.2",
+    "faiss-cpu>=1.7.4",
+    "numpy>=1.23",
 ]
 
 [project.optional-dependencies]

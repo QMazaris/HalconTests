@@ -3,6 +3,9 @@ import os
 from pathlib import Path
 from typing import Literal
 import logging
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
 from mcp.server.fastmcp import FastMCP
 from rapidfuzz import process, fuzz
@@ -215,6 +218,140 @@ def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
         
     finally:
         con.close()
+
+
+# ------------------------------------------------------------
+# Semantic operator matching (/semantic_match)
+# ------------------------------------------------------------
+
+# Configuration constants
+SEMANTIC_MODEL_NAME = os.getenv("HALCON_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+_EMBED_TEXT_MAX_CHARS = 2000  # Max characters taken from page_dump when description missing
+_TOP_K_DEFAULT = 5
+
+# Lazy-initialised globals
+_embedding_model: SentenceTransformer | None = None
+_faiss_index: faiss.IndexFlatIP | None = None
+_operator_meta: list[dict] | None = None
+
+
+def _ensure_semantic_index() -> None:
+    """Build the FAISS index with operator embeddings on first use."""
+    global _embedding_model, _faiss_index, _operator_meta
+
+    if _faiss_index is not None:
+        return  # Already built
+
+    logging.info("Building semantic embedding index for HALCON operators …")
+
+    # Load embedding model
+    _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+
+    # Fetch operator data
+    con = get_connection()
+    try:
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT name, description, page_dump, signature, url FROM operators"
+        ).fetchall()
+
+        texts: list[str] = []
+        _operator_meta = []
+
+        for row in rows:
+            text = row["description"] if row["description"] else row["page_dump"][:_EMBED_TEXT_MAX_CHARS]
+            texts.append(text)
+            _operator_meta.append(
+                {
+                    "name": row["name"],
+                    "description": row["description"] or "No description available",
+                    "signature": row["signature"],
+                    "url": row["url"],
+                    "page_dump": row["page_dump"],
+                }
+            )
+    finally:
+        con.close()
+
+    # Compute embeddings and build FAISS index (cosine similarity via dot-product on normalised vectors)
+    embeddings = _embedding_model.encode(
+        texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True
+    )
+
+    # Normalise to unit length for cosine similarity
+    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+    dim = embeddings.shape[1]
+    _faiss_index = faiss.IndexFlatIP(dim)
+    _faiss_index.add(embeddings.astype(np.float32))
+
+    logging.info("Semantic index built with %d operator embeddings", len(texts))
+
+
+@mcp.tool()
+def semantic_match(
+    query: str,
+    k: int = _TOP_K_DEFAULT,
+    detail: Literal["signature", "info", "full"] = "info",
+):
+    """Return top-k semantically matching HALCON operators for a natural language query.
+
+    Args:
+        query: Natural language search string.
+        k: Number of matches to return (default 5).
+        detail: Level of detail to return:
+                - "signature": Just the function signature/syntax
+                - "info": Name, signature, description, and URL (default)
+                - "full": Complete documentation including full page dump
+
+    Returns:
+        List of dictionaries with operator information and similarity score.
+    """
+
+    if not query or len(query.strip()) < 3:
+        return []
+
+    _ensure_semantic_index()
+
+    # Embed and normalise query
+    vec = _embedding_model.encode([query], convert_to_numpy=True)
+    vec = vec / np.linalg.norm(vec)
+
+    D, I = _faiss_index.search(vec.astype(np.float32), k)
+
+    results = []
+    for idx, score in zip(I[0], D[0]):
+        if idx < 0:
+            continue
+        meta = _operator_meta[idx]
+        op: dict = {
+            "name": meta["name"],
+            "score": float(score),
+        }
+
+        if detail == "signature":
+            op["signature"] = meta["signature"]
+        elif detail == "full":
+            op.update(
+                {
+                    "signature": meta["signature"],
+                    "description": meta["description"],
+                    "url": meta["url"],
+                    "page_dump": meta["page_dump"],
+                }
+            )
+        else:  # info (default)
+            op.update(
+                {
+                    "signature": meta["signature"],
+                    "description": meta["description"],
+                    "url": meta["url"],
+                }
+            )
+
+        results.append(op)
+
+    return results
 
 
 if __name__ == "__main__":

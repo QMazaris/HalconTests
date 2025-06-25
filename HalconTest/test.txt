@@ -1,0 +1,110 @@
+* ############################################################
+* HDevelop Script: Edge Comparison Between Two Images
+* Goal: Load two images, enhance contrast, detect edge in first,
+*       match edge in second, compute point-wise distances,
+*       visualize and report statistics.
+* ############################################################
+
+* 1. Load Images
+read_image (Image1, 'C:/Users/QuinnMazaris/Downloads/Image3.png')
+read_image (Image2, 'C:/Users/QuinnMazaris/Downloads/Image4.png')
+
+* 2. Ensure Grayscale
+count_channels (Image1, Channels1)
+if (Channels1 == 3)
+    rgb1_to_gray (Image1, Image1Gray)
+else
+    Image1Gray := Image1
+endif
+
+count_channels (Image2, Channels2)
+if (Channels2 == 3)
+    rgb1_to_gray (Image2, Image2Gray)
+else
+    Image2Gray := Image2
+endif
+
+* 3. Contrast Enhancement
+scale_image (Image1Gray, Image1Scaled, 1.5, 0)
+scale_image (Image2Gray, Image2Scaled, 1.5, 0)
+
+* 4. Edge Detection on First Image
+edges_sub_pix (Image1Scaled, Edges, 'canny', 1.5, 20, 40)
+
+* 5. Isolate a Prominent Contour
+select_shape_xld (Edges, ContoursLong, 'contlength', 'and', 200, 1.0e10)
+select_obj (ContoursLong, MainContour, 1)
+
+* 6. Create Shape Model From Contour
+create_shape_model_xld (MainContour, 'auto', 0, 0, 'auto', 'ignore_global_polarity', 10, ModelID)
+
+* 7. Find Model in Second Image
+find_shape_model (Image2Scaled, ModelID, 0, 0, 0.5, 1, 0, 'least_squares', 0, 0.8, Row, Column, Angle, Score)
+
+* 8. Transform Contour to Match
+vector_angle_to_rigid (0, 0, 0, Row, Column, Angle, HomMat2D)
+affine_trans_contour_xld (MainContour, MatchedContour, HomMat2D)
+
+* 9. Visualization Setup
+get_image_size (Image2, Width, Height)
+open_window (0, 0, Width, Height, 0, 'visible', '', WindowHandle)
+disp_image (Image2, WindowHandle)
+
+set_color (WindowHandle, 'red')
+disp_xld (MainContour, WindowHandle)
+set_color (WindowHandle, 'green')
+disp_xld (MatchedContour, WindowHandle)
+
+* 10. Extract Contour Points
+get_contour_xld (MainContour, Rows1, Cols1)
+get_contour_xld (MatchedContour, Rows2, Cols2)
+
+* 11. Verify Equal Lengths
+tuple_length (Rows1, Length1)
+tuple_length (Rows2, Length2)
+if (Length1 != Length2)
+    disp_text (WindowHandle, 'Error: Contours have different lengths', 'window', 12, 12, 'red', [], [])
+    stop ()
+endif
+
+* 12. Compute Point-wise Distances
+RowDiff := Rows1 - Rows2
+ColDiff := Cols1 - Cols2
+SqDist  := (RowDiff * RowDiff) + (ColDiff * ColDiff)
+tuple_sqrt (SqDist, Distances)
+
+* 13. Statistics
+tuple_min (Distances, MinDistance)
+tuple_max (Distances, MaxDistance)
+tuple_mean (Distances, MeanDistance)
+tuple_deviation (Distances, StdDistance)
+
+* Format Output Strings
+tuple_string (MinDistance, '.2f', MinStr)
+tuple_string (MaxDistance, '.2f', MaxStr)
+tuple_string (MeanDistance, '.2f', MeanStr)
+tuple_string (StdDistance, '.2f', StdStr)
+
+LineSpacing := 20
+RowText    := 12
+
+* Display Stats
+disp_text (WindowHandle, 'Min distance: ' + MinStr + ' px',   'window', RowText,          12, 'black', [], [])
+RowText := RowText + LineSpacing
+
+disp_text (WindowHandle, 'Max distance: ' + MaxStr + ' px',   'window', RowText,          12, 'black', [], [])
+RowText := RowText + LineSpacing
+
+disp_text (WindowHandle, 'Mean distance: ' + MeanStr + ' px', 'window', RowText,          12, 'black', [], [])
+RowText := RowText + LineSpacing
+
+disp_text (WindowHandle, 'Std deviation: ' + StdStr + ' px', 'window', RowText,          12, 'black', [], [])
+
+* 14. Warning if Mean Distance Exceeds Threshold
+if (MeanDistance > 2.0)
+    RowText := RowText + LineSpacing
+    disp_text (WindowHandle, '⚠️ Mean distance exceeds 2.0 pixels.', 'window', RowText, 12, 'red', [], [])
+endif
+
+* 15. Finish
+stop ()
