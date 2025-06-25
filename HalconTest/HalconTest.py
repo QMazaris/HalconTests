@@ -2,6 +2,7 @@ import sqlite3
 import os
 import pickle
 from pathlib import Path
+import sys
 from typing import Optional, Union
 import logging
 import numpy as np
@@ -410,9 +411,9 @@ def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
 def semantic_match(
     query: str,
     k: int = TOP_K_DEFAULT,
-    fields: list[str] = ["name", "signature", "description", "url"],
+    fields: list[str] = ["name"],
 ) -> list[dict]:
-    """Return top-k semantically matching HALCON operators for a natural language query.
+    """Return top-k semantically matching HALCON operators for a natural language query. Recommended to use default fields.
 
     Args:
         query: Natural language search string.
@@ -424,48 +425,53 @@ def semantic_match(
                - "parameters": Input parameters details
                - "results": Output results details  
                - "url": Documentation URL
-               Default: ["name", "signature", "description", "url"]
+               Default: ["name"]
 
     Returns:
         List of dictionaries with requested operator information and similarity score.
     """
-    if not query or len(query.strip()) < 3:
-        return []
+    try:
+        if not query or len(query.strip()) < 3:
+            return []
 
-    # Validate fields
-    valid_fields = {"name", "signature", "description", "parameters", "results", "url"}
-    
-    if "all" in fields:
-        requested_fields = list(valid_fields)
-    else:
-        requested_fields = [f for f in fields if f in valid_fields]
-    
-    if not requested_fields:
-        return []
-
-    _ensure_semantic_index()
-
-    # Embed and normalise query
-    vec = _embedding_model.encode([query], convert_to_numpy=True)
-    vec = vec / np.linalg.norm(vec)
-
-    D, I = _faiss_index.search(vec.astype(np.float32), k)
-
-    results = []
-    for idx, score in zip(I[0], D[0]):
-        if idx < 0:
-            continue
-        meta = _operator_meta[idx]
+        # Validate fields
+        valid_fields = {"name", "signature", "description", "parameters", "results", "url"}
         
-        # Build result with requested fields plus score
-        result = {"score": float(score)}
-        for field in requested_fields:
-            if field in meta:
-                result[field] = meta[field]
+        if "all" in fields:
+            requested_fields = list(valid_fields)
+        else:
+            requested_fields = [f for f in fields if f in valid_fields]
         
-        results.append(result)
+        if not requested_fields:
+            return []
 
-    return results
+        _ensure_semantic_index()
+
+        # Embed and normalise query
+        vec = _embedding_model.encode([query], convert_to_numpy=True)
+        vec = vec / np.linalg.norm(vec)
+
+        D, I = _faiss_index.search(vec.astype(np.float32), k)
+
+        results = []
+        for idx, score in zip(I[0], D[0]):
+            if idx < 0:
+                continue
+            meta = _operator_meta[idx]
+            
+            # Build result with requested fields plus score
+            result = {"score": float(score)}
+            for field in requested_fields:
+                if field in meta:
+                    result[field] = meta[field]
+            
+            results.append(result)
+
+        return results
+    
+    except Exception as e:
+        logging.exception("Error in semantic_match: %s", e)
+        return []
 
 
 @mcp.tool()
@@ -484,34 +490,49 @@ def semantic_code_search(
     Returns:
         List of dictionaries with code example information and similarity score.
     """
-    if not query or len(query.strip()) < 3:
+    try:
+        if not query or len(query.strip()) < 3:
+            return []
+
+        _ensure_code_index()
+
+        vec = _embedding_model.encode([query], convert_to_numpy=True)
+        vec = vec / np.linalg.norm(vec)
+
+        D, I = _code_index.search(vec.astype(np.float32), k)
+
+        results = []
+        for idx, score in zip(I[0], D[0]):
+            if idx < 0:
+                continue
+            meta = _code_meta[idx]
+            results.append({
+                "title": meta["title"],
+                "description": meta["description"],
+                "tags": meta["tags"],
+                "code": meta["code"],
+                "score": float(score),
+            })
+
+        return results
+    
+    except Exception as e:
+        logging.exception("Error in semantic_code_search: %s", e)
         return []
-
-    _ensure_code_index()
-
-    vec = _embedding_model.encode([query], convert_to_numpy=True)
-    vec = vec / np.linalg.norm(vec)
-
-    D, I = _code_index.search(vec.astype(np.float32), k)
-
-    results = []
-    for idx, score in zip(I[0], D[0]):
-        if idx < 0:
-            continue
-        meta = _code_meta[idx]
-        results.append({
-            "title": meta["title"],
-            "description": meta["description"],
-            "tags": meta["tags"],
-            "code": meta["code"],
-            "score": float(score),
-        })
-
-    return results
 
 
 if __name__ == "__main__":
-    logging.info("Starting HALCON MCP server …")
-    validate_database()
-    logging.info("Launching FastMCP (transport=stdio)…")
-    mcp.run(transport="stdio") 
+    try:
+        logging.info("Starting HALCON MCP server …")
+        validate_database()
+        logging.info("Launching FastMCP (transport=stdio)…")
+        
+        # Run with error handling
+        mcp.run(transport="stdio")
+        
+    except KeyboardInterrupt:
+        logging.info("Server shutdown requested")
+        sys.exit(0)
+    except Exception as e:
+        logging.exception("Fatal error in HALCON MCP server: %s", e)
+        sys.exit(1) 
