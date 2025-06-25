@@ -386,7 +386,7 @@ def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
         limit: Maximum results to return (default: 50, max: 100)
 
     Returns:
-        Paginated list of operators with brief descriptions.
+        Paginated list of operators.
     """
     with get_connection() as con:
         cur = con.cursor()
