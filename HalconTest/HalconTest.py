@@ -2,17 +2,17 @@ import sqlite3
 import os
 import pickle
 from pathlib import Path
-from typing import Literal
+from typing import Optional, Union
 import logging
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+from contextlib import contextmanager
 
 from mcp.server.fastmcp import FastMCP
-from rapidfuzz import process, fuzz
 
+# Configuration Constants
 DB_PATH = Path(os.getenv("HALCON_DB_PATH", Path(__file__).with_name("combined.db")))
-# New: path to the code examples database (populated via chunk_scanner_cli.py)
 CODE_DB_PATH = Path(os.getenv("HALCON_CODE_DB_PATH", Path(__file__).with_name("halcon_code_examplesV2.db")))
 
 # Pre-built index paths
@@ -21,231 +21,18 @@ OPERATOR_META_PATH = Path(__file__).with_name("halcon_operators_meta.pkl")
 CODE_INDEX_PATH = Path(__file__).with_name("halcon_code_examples.faiss")
 CODE_META_PATH = Path(__file__).with_name("halcon_code_examples_meta.pkl")
 
+# Semantic search configuration
+SEMANTIC_MODEL_NAME = os.getenv("HALCON_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+TOP_K_DEFAULT = 5
+USE_QUANTIZATION = True
+QUANTIZATION_BITS = 8
+NPROBE = 16
+
 # Create the FastMCP server
 mcp = FastMCP("halcon-mcp-server")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-
-def get_connection():
-    """Get database connection."""
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def get_code_con():
-    """Return SQLite connection to the HALCON code examples database."""
-    con = sqlite3.connect(CODE_DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def validate_database() -> None:
-    """Validate database connectivity and log basic stats."""
-    if not DB_PATH.exists():
-        logging.error("Database file not found at %s", DB_PATH)
-        raise FileNotFoundError(f"Database not found: {DB_PATH}")
-
-    con = sqlite3.connect(DB_PATH)
-    try:
-        cur = con.cursor()
-        count = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
-        logging.info("Database connected: %d operators available", count)
-        
-        # Check if we have the new schema
-        columns = cur.execute("PRAGMA table_info(operators)").fetchall()
-        col_names = [col[1] for col in columns]
-        required_cols = ['name', 'signature', 'description', 'parameters', 'results', 'url']
-        
-        for col in required_cols:
-            if col not in col_names:
-                logging.error("Missing required column: %s", col)
-                raise ValueError(f"Database schema missing column: {col}")
-        
-        logging.info("Database schema validated successfully")
-        
-    except Exception as exc:
-        logging.exception("Failed to query database: %s", exc)
-        raise
-    finally:
-        con.close()
-
-
-@mcp.resource("halcon://operators")
-def get_operators_info() -> str:
-    """Get information about the HALCON operators database."""
-    con = get_connection()
-    try:
-        cur = con.cursor()
-        count = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
-        return f"HALCON Operators Database contains {count} operators with signature, description, page dumps, and documentation URLs."
-    finally:
-        con.close()
-
-
-@mcp.tool()
-def search_halcon_operators(query: str, limit: int = 10) -> str:
-    """Search HALCON operators by name or functionality.
-
-    Args:
-        query: Search term for operator name or functionality
-        limit: Maximum number of results (default: 10, max: 20)
-
-    Returns:
-        Formatted list of matching operators with similarity scores.
-    """
-    con = get_connection()
-    try:
-        cur = con.cursor()
-        
-        # Get all operators for fuzzy search
-        rows = cur.execute("SELECT name, description FROM operators").fetchall()
-        
-        # Fuzzy search on names and descriptions
-        choices = {}
-        for row in rows:
-            choices[row["name"]] = row
-            # Also search descriptions
-            if row["description"]:
-                choices[f"{row['name']} - {row['description'][:100]}"] = row
-        
-        best = process.extract(query, choices.keys(), scorer=fuzz.WRatio, limit=limit)
-        
-        results = []
-        seen = set()
-        for match, score, _ in best:
-            if score > 30:  # Minimum similarity threshold
-                row = choices[match]
-                if row["name"] not in seen:
-                    seen.add(row["name"])
-                    results.append({
-                        "name": row["name"],
-                        "description": row["description"] or "No description available",
-                        "score": score
-                    })
-        
-        if not results:
-            return f"No HALCON operators found matching '{query}'"
-        
-        result_text = f"Found {len(results)} HALCON operators matching '{query}':\n\n"
-        for r in results:
-            result_text += f"**{r['name']}** (similarity: {r['score']}%)\n"
-            result_text += f"Description: {r['description'][:150]}{'...' if len(r['description']) > 150 else ''}\n\n"
-        
-        return result_text
-        
-    finally:
-        con.close()
-
-
-@mcp.tool()
-def get_halcon_operator(name: str, detail: Literal["signature", "info", "full"] = "info") -> str:
-    """Get HALCON operator information with different levels of detail.
-
-    Args:
-        name: Exact name of the HALCON operator (case-insensitive)
-        detail: Level of detail to return:
-                - "signature": Just the function signature/syntax
-                - "info": Name, signature, description, and URL (default)
-                - "full": Complete documentation including full page dump
-
-    Returns:
-        Operator information formatted according to detail level.
-    """
-    con = get_connection()
-    try:
-        cur = con.cursor()
-        
-        # Select fields based on detail level
-        if detail == "signature":
-            fields = "name, signature"
-        elif detail == "full":
-            fields = "name, signature, description, url"
-        else:  # info
-            fields = "name, signature, description, url"
-        
-        row = cur.execute(
-            f"SELECT {fields} FROM operators WHERE name = ? COLLATE NOCASE", 
-            (name,)
-        ).fetchone()
-        
-        if not row:
-            return f"HALCON operator '{name}' not found"
-        
-        # Format response based on detail level
-        if detail == "signature":
-            if row['signature']:
-                return f"**{row['name']}** signature:\n```\n{row['signature']}\n```"
-            else:
-                return f"**{row['name']}**: No signature available"
-        
-        elif detail == "full":
-            result_text = f"**{row['name']} - Complete Documentation**\n\n"
-            if row['signature']:
-                result_text += f"**Signature:**\n```\n{row['signature']}\n```\n\n"
-            result_text += f"**Description:**\n{row['description'] or 'No description available'}\n\n"
-            result_text += f"**Source:** {row['url']}\n"
-            return result_text
-        
-        else:  # info
-            result_text = f"**{row['name']}**\n\n"
-            if row['signature']:
-                result_text += f"**Signature:**\n```\n{row['signature']}\n```\n\n"
-            result_text += f"**Description:**\n{row['description'] or 'No description available'}\n\n"
-            result_text += f"**Documentation URL:**\n{row['url']}\n"
-            return result_text
-        
-    finally:
-        con.close()
-
-
-@mcp.tool()
-def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
-    """List HALCON operators with pagination.
-
-    Args:
-        offset: Number of results to skip (default: 0)
-        limit: Maximum results to return (default: 50, max: 100)
-
-    Returns:
-        Paginated list of operators with brief descriptions.
-    """
-    con = get_connection()
-    try:
-        cur = con.cursor()
-        
-        rows = cur.execute(
-            "SELECT name, description FROM operators ORDER BY name LIMIT ? OFFSET ?",
-            (limit, offset)
-        ).fetchall()
-        
-        total = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
-        
-        result_text = f"HALCON Operators ({offset + 1}-{offset + len(rows)} of {total}):\n\n"
-        for row in rows:
-            description_preview = row["description"][:100] + "..." if row["description"] and len(row["description"]) > 100 else row["description"] or "No description available"
-            result_text += f"**{row['name']}**\n{description_preview}\n\n"
-        
-        return result_text
-        
-    finally:
-        con.close()
-
-
-# ------------------------------------------------------------
-# Semantic operator matching (/semantic_match)
-# ------------------------------------------------------------
-
-# Configuration constants
-SEMANTIC_MODEL_NAME = os.getenv("HALCON_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-_TOP_K_DEFAULT = 5
-
-# Quantization settings for performance
-USE_QUANTIZATION = True  # Set to False for exact search, True for faster approximate search
-QUANTIZATION_BITS = 8    # 8-bit quantization for good speed/accuracy tradeoff
-NPROBE = 16             # Number of clusters to search (higher = more accurate but slower)
 
 # Global variables for semantic search
 _embedding_model = None
@@ -255,9 +42,89 @@ _code_index = None
 _code_meta = None
 
 
+@contextmanager
+def get_connection():
+    """Context manager for database connections."""
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+@contextmanager
+def get_code_connection():
+    """Context manager for code database connections."""
+    con = sqlite3.connect(CODE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def validate_database() -> None:
+    """Validate database connectivity and log basic stats."""
+    if not DB_PATH.exists():
+        logging.error("Database file not found at %s", DB_PATH)
+        raise FileNotFoundError(f"Database not found: {DB_PATH}")
+
+    with get_connection() as con:
+        try:
+            cur = con.cursor()
+            count = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
+            logging.info("Database connected: %d operators available", count)
+            
+            # Check if we have the new schema
+            columns = cur.execute("PRAGMA table_info(operators)").fetchall()
+            col_names = [col[1] for col in columns]
+            required_cols = ['name', 'signature', 'description', 'parameters', 'results', 'url']
+            
+            for col in required_cols:
+                if col not in col_names:
+                    logging.error("Missing required column: %s", col)
+                    raise ValueError(f"Database schema missing column: {col}")
+            
+            logging.info("Database schema validated successfully")
+            
+        except Exception as exc:
+            logging.exception("Failed to query database: %s", exc)
+            raise
+
+
+def _build_faiss_index(embeddings: np.ndarray, use_quantization: bool = True) -> faiss.Index:
+    """Build optimized FAISS index based on dataset size and settings."""
+    dim = embeddings.shape[1]
+    n_vectors = len(embeddings)
+    
+    if use_quantization and n_vectors > 500:
+        # Use IVF (Inverted File) with inner product for cosine similarity on normalized vectors
+        n_centroids = min(max(int(np.sqrt(n_vectors)), 50), n_vectors // 10)
+        index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, n_centroids, faiss.METRIC_INNER_PRODUCT)
+        index.train(embeddings.astype(np.float32))
+        index.add(embeddings.astype(np.float32))
+        index.nprobe = NPROBE
+        logging.info("Built quantized IVF index with %d centroids", n_centroids)
+    else:
+        # Use flat index for small datasets or exact search
+        index = faiss.IndexFlatIP(dim)
+        index.add(embeddings.astype(np.float32))
+        logging.info("Built flat index for exact search")
+    
+    return index
+
+
+def _ensure_embedding_model() -> None:
+    """Ensure the embedding model is loaded."""
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+
+
 def _ensure_semantic_index() -> None:
     """Load or build the FAISS index with operator embeddings."""
-    global _embedding_model, _faiss_index, _operator_meta
+    global _faiss_index, _operator_meta
 
     if _faiss_index is not None:
         return  # Already loaded
@@ -270,8 +137,7 @@ def _ensure_semantic_index() -> None:
             with open(OPERATOR_META_PATH, 'rb') as f:
                 _operator_meta = pickle.load(f)
             
-            # Load embedding model for query encoding
-            _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+            _ensure_embedding_model()
             
             # Set nprobe for quantized indices
             if hasattr(_faiss_index, 'nprobe'):
@@ -284,14 +150,13 @@ def _ensure_semantic_index() -> None:
 
     # Build index from scratch
     logging.info("Building semantic embedding index for HALCON operators...")
-    _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+    _ensure_embedding_model()
 
     # Fetch operator data
-    con = get_connection()
-    try:
+    with get_connection() as con:
         cur = con.cursor()
         rows = cur.execute(
-            "SELECT name, description, signature, url FROM operators"
+            "SELECT name, description, signature, url, parameters, results FROM operators"
         ).fetchall()
 
         texts: list[str] = []
@@ -306,10 +171,10 @@ def _ensure_semantic_index() -> None:
                     "description": row["description"] or "No description available",
                     "signature": row["signature"],
                     "url": row["url"],
+                    "parameters": row["parameters"],
+                    "results": row["results"],
                 }
             )
-    finally:
-        con.close()
 
     # Compute embeddings
     embeddings = _embedding_model.encode(
@@ -319,34 +184,13 @@ def _ensure_semantic_index() -> None:
     # Normalize to unit length for cosine similarity
     embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
 
-    dim = embeddings.shape[1]
-    n_vectors = len(embeddings)
-
-    # Create optimized index based on dataset size and settings
-    if USE_QUANTIZATION and n_vectors > 1000:
-        # Use IVF (Inverted File) with inner product for cosine similarity on normalized vectors
-        n_centroids = min(max(int(np.sqrt(n_vectors)), 100), n_vectors // 10)
-        _faiss_index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, n_centroids, faiss.METRIC_INNER_PRODUCT)
-        _faiss_index.train(embeddings.astype(np.float32))
-        _faiss_index.add(embeddings.astype(np.float32))
-        _faiss_index.nprobe = NPROBE
-        logging.info("Built quantized IVF index with %d centroids", n_centroids)
-    else:
-        # Use flat index for small datasets or exact search
-        _faiss_index = faiss.IndexFlatIP(dim)
-        _faiss_index.add(embeddings.astype(np.float32))
-        logging.info("Built flat index for exact search")
-
+    _faiss_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
     logging.info("Semantic index built with %d operator embeddings", len(texts))
 
 
-# ------------------------------------------------------------
-# Semantic code example matching (internal helper)
-# ------------------------------------------------------------
-
 def _ensure_code_index() -> None:
     """Load or build the FAISS index with embeddings of code examples."""
-    global _embedding_model, _code_index, _code_meta
+    global _code_index, _code_meta
 
     if _code_index is not None:
         return  # Already loaded
@@ -359,9 +203,7 @@ def _ensure_code_index() -> None:
             with open(CODE_META_PATH, 'rb') as f:
                 _code_meta = pickle.load(f)
             
-            # Load embedding model for query encoding (reuse if already loaded)
-            if _embedding_model is None:
-                _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+            _ensure_embedding_model()
             
             # Set nprobe for quantized indices
             if hasattr(_code_index, 'nprobe'):
@@ -374,14 +216,10 @@ def _ensure_code_index() -> None:
 
     # Build index from scratch
     logging.info("Building semantic embedding index for HALCON code examples...")
-
-    # Load embedding model (reuse if already loaded)
-    if _embedding_model is None:
-        _embedding_model = SentenceTransformer(SEMANTIC_MODEL_NAME)
+    _ensure_embedding_model()
 
     # Fetch code example data
-    con = get_code_con()
-    try:
+    with get_code_connection() as con:
         cur = con.cursor()
         rows = cur.execute(
             "SELECT title, description, code, tags FROM examples"
@@ -402,8 +240,6 @@ def _ensure_code_index() -> None:
                     "tags": row["tags"],
                 }
             )
-    finally:
-        con.close()
 
     # Compute embeddings
     embeddings = _embedding_model.encode(
@@ -411,48 +247,147 @@ def _ensure_code_index() -> None:
     )
     embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
 
-    dim = embeddings.shape[1]
-    n_vectors = len(embeddings)
-
-    # Create optimized index based on dataset size and settings
-    if USE_QUANTIZATION and n_vectors > 500:
-        # Use IVF for code examples (smaller dataset, fewer centroids)
-        n_centroids = min(max(int(np.sqrt(n_vectors)), 50), n_vectors // 5)
-        _code_index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, n_centroids, faiss.METRIC_INNER_PRODUCT)
-        _code_index.train(embeddings.astype(np.float32))
-        _code_index.add(embeddings.astype(np.float32))
-        _code_index.nprobe = NPROBE
-        logging.info("Built quantized code index with %d centroids", n_centroids)
-    else:
-        # Use flat index for small datasets
-        _code_index = faiss.IndexFlatIP(dim)
-        _code_index.add(embeddings.astype(np.float32))
-        logging.info("Built flat code index for exact search")
-
+    _code_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
     logging.info("Semantic index built with %d code example embeddings", len(texts))
+
+
+@mcp.resource("halcon://operators")
+def get_operators_info() -> str:
+    """Get a summary of the HALCON knowledge base, including operator and code example counts."""
+    with get_connection() as con:
+        op_count = con.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
+
+    code_count = 0
+    try:
+        if CODE_DB_PATH.exists():
+            with get_code_connection() as code_con:
+                code_count = code_con.execute("SELECT COUNT(*) FROM examples").fetchone()[0]
+    except Exception:
+        pass  # It's okay if code examples are not available.
+
+    return (
+        f"HALCON knowledge base ready. Contains {op_count} operators and {code_count} code examples. "
+        "Use tools for semantic search, detailed operator lookup, and listing."
+    )
+
+
+@mcp.tool()
+def get_halcon_operator(
+    name: str, 
+    fields: list[str] = ["name", "signature", "description", "url"]
+) -> Union[dict, str]:
+    """Get HALCON operator information with flexible field selection.
+
+    Args:
+        name: Exact name of the HALCON operator (case-insensitive)
+        fields: List of fields to return, or ["all"] to get all fields. Available fields:
+               - "name": Operator name
+               - "signature": Function signature/syntax
+               - "description": Operator description
+               - "parameters": Input parameters details
+               - "results": Output results details  
+               - "url": Documentation URL
+               Default: ["name", "signature", "description", "url"]
+
+    Returns:
+        Dictionary with requested fields, or error message if operator not found.
+    """
+    valid_fields = {"name", "signature", "description", "parameters", "results", "url"}
+    
+    if "all" in fields:
+        requested_fields = list(valid_fields)
+    else:
+        requested_fields = [f for f in fields if f in valid_fields]
+    
+    if not requested_fields:
+        return "No valid fields specified. Available fields: name, signature, description, parameters, results, url, or 'all'."
+    
+    # Build SQL query with only requested fields
+    field_str = ", ".join(requested_fields)
+    
+    with get_connection() as con:
+        cur = con.cursor()
+        
+        row = cur.execute(
+            f"SELECT {field_str} FROM operators WHERE name = ? COLLATE NOCASE", 
+            (name,)
+        ).fetchone()
+        
+        if not row:
+            return f"HALCON operator '{name}' not found"
+        
+        # Build result dictionary with only requested fields
+        result = {}
+        for field in requested_fields:
+            result[field] = row[field] if row[field] is not None else ""
+        
+        return result
+
+
+@mcp.tool()
+def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
+    """List HALCON operators with pagination.
+
+    Args:
+        offset: Number of results to skip (default: 0)
+        limit: Maximum results to return (default: 50, max: 100)
+
+    Returns:
+        Paginated list of operators with brief descriptions.
+    """
+    with get_connection() as con:
+        cur = con.cursor()
+        
+        rows = cur.execute(
+            "SELECT name, description FROM operators ORDER BY name LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        
+        total = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
+        
+        result_text = f"HALCON Operators ({offset + 1}-{offset + len(rows)} of {total}):\n\n"
+        for row in rows:
+            description_preview = row["description"][:100] + "..." if row["description"] and len(row["description"]) > 100 else row["description"] or "No description available"
+            result_text += f"**{row['name']}**\n{description_preview}\n\n"
+        
+        return result_text
 
 
 @mcp.tool()
 def semantic_match(
     query: str,
-    k: int = _TOP_K_DEFAULT,
-    detail: Literal["signature", "info", "full"] = "info",
-):
+    k: int = TOP_K_DEFAULT,
+    fields: list[str] = ["name", "signature", "description", "url"],
+) -> list[dict]:
     """Return top-k semantically matching HALCON operators for a natural language query.
 
     Args:
         query: Natural language search string.
         k: Number of matches to return (default 5).
-        detail: Level of detail to return:
-                - "signature": Just the function signature/syntax
-                - "info": Name, signature, description, and URL (default)
-                - "full": Complete documentation including full page dump
+        fields: List of fields to return, or ["all"] to get all fields. Available fields:
+               - "name": Operator name
+               - "signature": Function signature/syntax
+               - "description": Operator description
+               - "parameters": Input parameters details
+               - "results": Output results details  
+               - "url": Documentation URL
+               Default: ["name", "signature", "description", "url"]
 
     Returns:
-        List of dictionaries with operator information and similarity score.
+        List of dictionaries with requested operator information and similarity score.
     """
-
     if not query or len(query.strip()) < 3:
+        return []
+
+    # Validate fields
+    valid_fields = {"name", "signature", "description", "parameters", "results", "url"}
+    
+    if "all" in fields:
+        requested_fields = list(valid_fields)
+    else:
+        requested_fields = [f for f in fields if f in valid_fields]
+    
+    if not requested_fields:
         return []
 
     _ensure_semantic_index()
@@ -468,31 +403,14 @@ def semantic_match(
         if idx < 0:
             continue
         meta = _operator_meta[idx]
-        op: dict = {
-            "name": meta["name"],
-            "score": float(score),
-        }
-
-        if detail == "signature":
-            op["signature"] = meta["signature"]
-        elif detail == "full":
-            op.update(
-                {
-                    "signature": meta["signature"],
-                    "description": meta["description"],
-                    "url": meta["url"],
-                }
-            )
-        else:  # info (default)
-            op.update(
-                {
-                    "signature": meta["signature"],
-                    "description": meta["description"],
-                    "url": meta["url"],
-                }
-            )
-
-        results.append(op)
+        
+        # Build result with requested fields plus score
+        result = {"score": float(score)}
+        for field in requested_fields:
+            if field in meta:
+                result[field] = meta[field]
+        
+        results.append(result)
 
     return results
 
@@ -500,13 +418,19 @@ def semantic_match(
 @mcp.tool()
 def semantic_code_search(
     query: str,
-    k: int = _TOP_K_DEFAULT,
+    k: int = TOP_K_DEFAULT,
 ) -> list[dict]:
     """Return top-k code example chunks matching a natural language query.
 
     Each result contains title, description, tags, full code, and similarity score.
+    
+    Args:
+        query: Natural language search string.
+        k: Number of matches to return (default 5).
+        
+    Returns:
+        List of dictionaries with code example information and similarity score.
     """
-
     if not query or len(query.strip()) < 3:
         return []
 
