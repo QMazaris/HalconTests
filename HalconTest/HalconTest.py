@@ -525,6 +525,13 @@ if __name__ == "__main__":
     try:
         logging.info("Starting HALCON MCP server …")
         validate_database()
+        
+        # Pre-load models and indices to prevent Claude Desktop timeouts
+        logging.info("Warming up semantic indices...")
+        _ensure_semantic_index()
+        _ensure_code_index()
+        logging.info("Warmup complete")
+        
         logging.info("Launching FastMCP (transport=stdio)…")
         
         # Run with error handling

@@ -1,0 +1,175 @@
+* Cylindrical Surface Generation, Perturbation, and Fitting Program
+* Creates a 50mm radius cylindrical surface, adds gaussian perturbations,
+* then fits it back to an STL CAD model and visualizes distances
+
+dev_update_off()
+dev_close_window()
+
+* Parameters
+Radius := 0.05
+CylinderHeight := 0.1
+PerturbationStdDev := 0.001
+NumPointsCircumference := 100
+NumPointsHeight := 50
+STLFileName := 'cylinder_50mm.stl'
+
+* Step 1: Create ideal cylindrical surface points
+X := []
+Y := []
+Z := []
+
+for i := 0 to NumPointsHeight - 1 by 1
+    ZCoord := (real(i) / real(NumPointsHeight - 1)) * CylinderHeight - CylinderHeight/2
+    for j := 0 to NumPointsCircumference - 1 by 1
+        Angle := (real(j) / real(NumPointsCircumference)) * 2 * 3.14159265359
+        XCoord := Radius * cos(Angle)
+        YCoord := Radius * sin(Angle)
+        
+        X := [X, XCoord]
+        Y := [Y, YCoord]
+        Z := [Z, ZCoord]
+    endfor
+endfor
+
+* Step 2: Create ideal cylinder 3D object model
+gen_object_model_3d_from_points(X, Y, Z, IdealCylinder)
+
+* Step 3: Add gaussian perturbations to create realistic imperfections
+PerturbedX := []
+PerturbedY := []
+PerturbedZ := []
+
+* Generate random perturbations using random numbers
+tuple_rand(|X|, RandomX)
+tuple_rand(|X|, RandomY)
+tuple_rand(|X|, RandomZ)
+
+for i := 0 to |X| - 1 by 1
+    * Convert uniform random to gaussian approximation (Box-Muller transform simplified)
+    NoiseX := PerturbationStdDev * (RandomX[i] - 0.5) * 2.449
+    NoiseY := PerturbationStdDev * (RandomY[i] - 0.5) * 2.449
+    NoiseZ := PerturbationStdDev * (RandomZ[i] - 0.5) * 2.449
+    
+    * Add perturbations with gaussian shape influence
+    DistFromCenter := sqrt(X[i]*X[i] + Y[i]*Y[i])
+    GaussianWeight := exp(-((DistFromCenter - Radius)*(DistFromCenter - Radius))/(2*0.01*0.01))
+    
+    PertX := X[i] + NoiseX * GaussianWeight
+    PertY := Y[i] + NoiseY * GaussianWeight  
+    PertZ := Z[i] + NoiseZ * GaussianWeight
+    
+    PerturbedX := [PerturbedX, PertX]
+    PerturbedY := [PerturbedY, PertY]
+    PerturbedZ := [PerturbedZ, PertZ]
+endfor
+
+* Step 4: Create perturbed point cloud object model
+gen_object_model_3d_from_points(PerturbedX, PerturbedY, PerturbedZ, PerturbedCylinderTemp)
+
+* Step 4a: Compute normals for the perturbed point cloud
+surface_normals_object_model_3d(PerturbedCylinderTemp, 'mls', ['mls_kNN'], [20], PerturbedCylinder)
+clear_object_model_3d(PerturbedCylinderTemp)
+
+* Step 5: Read CAD model from STL file
+try
+    read_object_model_3d(STLFileName, 'mm', [], [], CADCylinder, Status)
+catch (Exception)
+    * If STL file doesn't exist, create reference cylinder
+    Pose := [0, 0, 0, 0, 0, 0, 0]
+    gen_cylinder_object_model_3d(Pose, Radius, -CylinderHeight/2, CylinderHeight/2, CADCylinder)
+    sample_object_model_3d(CADCylinder, 'fast', 0.002, [], [], CADCylinder)
+endtry
+
+* Step 6: Fit cylinder primitive to perturbed data
+fit_primitives_object_model_3d(PerturbedCylinder, \
+                              ['primitive_type', 'fitting_algorithm'], \
+                              ['cylinder', 'least_squares'], \
+                              FittedCylinder)
+
+* Step 7: Get fitted cylinder parameters
+get_object_model_3d_params(FittedCylinder, 'primitive_pose', FittedPose)
+get_object_model_3d_params(FittedCylinder, 'primitive_parameter', FittedParams)
+FittedRadius := FittedParams[6]
+
+* Step 8: Calculate distances between perturbed points and CAD model
+distance_object_model_3d(PerturbedCylinder, CADCylinder, [], 0, \
+                        ['signed_distances'], ['true'])
+
+* Step 9: Get distance values for analysis
+get_object_model_3d_params(PerturbedCylinder, '&distance', DistanceValues)
+
+* Step 10: Calculate statistics
+tuple_min(DistanceValues, MinDistance)
+tuple_max(DistanceValues, MaxDistance)
+tuple_mean(DistanceValues, MeanDistance)
+tuple_deviation(DistanceValues, StdDevDistance)
+
+* Step 11: Create visualization window
+dev_open_window(0, 0, 800, 600, 'black', WindowHandle)
+dev_set_draw('margin')
+dev_set_line_width(2)
+
+* Step 12: Visualize results with color-coded distances
+visualize_object_model_3d(WindowHandle, [PerturbedCylinder, CADCylinder], \
+                         [], [], \
+                         ['color_0', 'color_1', 'color_attrib_0', 'lut_0'], \
+                         ['red', 'green', '&distance', 'rainbow'], \
+                         'Cylinder Fitting Analysis', \
+                         ['Perturbed Data', 'CAD Reference'], \
+                         'Distance Visualization', \
+                         PoseOut)
+
+* Step 13: Display results in console
+write_string(WindowHandle, 'Cylinder Fitting Results:')
+write_string(WindowHandle, 'Fitted Radius: ' + FittedRadius$'.4f' + ' m')
+write_string(WindowHandle, 'Target Radius: ' + Radius$'.4f' + ' m')
+write_string(WindowHandle, 'Radius Error: ' + (FittedRadius - Radius)$'.4f' + ' m')
+write_string(WindowHandle, '')
+write_string(WindowHandle, 'Distance Statistics:')
+write_string(WindowHandle, 'Min Distance: ' + MinDistance$'.4f' + ' m')
+write_string(WindowHandle, 'Max Distance: ' + MaxDistance$'.4f' + ' m')
+write_string(WindowHandle, 'Mean Distance: ' + MeanDistance$'.4f' + ' m')
+write_string(WindowHandle, 'Std Dev: ' + StdDevDistance$'.4f' + ' m')
+
+* Step 14: Write results to file
+open_file('cylinder_analysis_results.txt', 'output', FileHandle)
+fwrite_string(FileHandle, 'Cylinder Surface Analysis Results\n')
+fwrite_string(FileHandle, '================================\n\n')
+fwrite_string(FileHandle, 'Parameters:\n')
+fwrite_string(FileHandle, 'Target Radius: ' + Radius$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Cylinder Height: ' + CylinderHeight$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Perturbation Std Dev: ' + PerturbationStdDev$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Number of Points: ' + |PerturbedX| + '\n\n')
+
+fwrite_string(FileHandle, 'Fitted Cylinder Parameters:\n')
+fwrite_string(FileHandle, 'Fitted Radius: ' + FittedRadius$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Radius Error: ' + (FittedRadius - Radius)$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Relative Error: ' + ((FittedRadius - Radius)/Radius * 100)$'.3f' + ' %\n\n')
+
+fwrite_string(FileHandle, 'Distance Analysis:\n')
+fwrite_string(FileHandle, 'Minimum Distance: ' + MinDistance$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Maximum Distance: ' + MaxDistance$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Mean Distance: ' + MeanDistance$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Standard Deviation: ' + StdDevDistance$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'RMS Distance: ' + sqrt(MeanDistance*MeanDistance + StdDevDistance*StdDevDistance)$'.6f' + ' m\n\n')
+
+* Write individual distance values
+fwrite_string(FileHandle, 'Individual Distance Values (m):\n')
+for i := 0 to |DistanceValues| - 1 by 1
+    fwrite_string(FileHandle, 'Point ' + i + ': ' + DistanceValues[i]$'.6f' + '\n')
+endfor
+
+close_file(FileHandle)
+
+* Step 15: Export point clouds for external analysis
+write_object_model_3d(PerturbedCylinder, 'ply', 'perturbed_cylinder.ply', [], [])
+write_object_model_3d(FittedCylinder, 'ply', 'fitted_cylinder.ply', [], [])
+
+* Step 16: Clean up memory
+clear_object_model_3d([IdealCylinder, PerturbedCylinder, CADCylinder, FittedCylinder])
+
+* Display completion message
+dev_disp_text('Analysis complete. Results saved to cylinder_analysis_results.txt', \
+              'window', 'bottom', 'left', 'black', [], [])
+
+stop() 

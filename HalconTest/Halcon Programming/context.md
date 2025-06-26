@@ -3,6 +3,7 @@
 ## ⚠️ Key Rule
 **Never guess HALCON operator syntax. Always validate using the MCP server tools.**
 **Do not write inline comments.**
+**Multiline function calls need \ at the end of each line**
 
 
 ## 🎯 Recommended Workflow

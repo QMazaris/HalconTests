@@ -30,5 +30,9 @@
   {
     "type": "sqlite",
     "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\halcon_code_examplesV2.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\combined.db"
   }
 ]

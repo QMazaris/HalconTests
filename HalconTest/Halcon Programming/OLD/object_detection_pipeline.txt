@@ -1,0 +1,73 @@
+* ---------------------------------------------
+* Object Detection Pipeline with HALCON
+* ---------------------------------------------
+
+* --------- USER PARAMETERS (EDIT AS NEEDED) ---------
+DatasetFile := 'dataset_detection.hdict'
+PreprocessDir := 'dl_preprocessed_dataset'
+Backbone := 'efficientnet_b0'
+TrainingPercent := 70
+ValidationPercent := 15
+NumEpochs := 50
+EnableDisplay := 'true'
+RandomSeed := 42
+OverwritePreprocess := 'auto'            * allowed values: 'true','false','auto'
+ModelOutDir := 'trained_detection_model'
+EvaluationResultFile := 'evaluation_result.hdict'
+* ----------------------------------------------------
+
+* Create output directory for model
+make_dir (ModelOutDir)
+
+* ---------------------------------------------
+* Load dataset dictionary
+read_dict (DatasetFile, [], [], DatasetHandle)
+
+* Determine number of classes
+get_dict_tuple (DatasetHandle, 'class_ids', ClassIDs)
+tuple_length (ClassIDs, NumClasses)
+
+* ---------------------------------------------
+* Create detection model
+create_dict (DLModelDetectionParam)
+set_dict_tuple (DLModelDetectionParam, 'instance_type', 'rectangle1')
+create_dl_model_detection (Backbone, NumClasses, DLModelDetectionParam, DLModelHandle)
+
+* ---------------------------------------------
+* Generate preprocessing parameters from model
+create_dl_preprocess_param_from_model (DLModelHandle, 'none', 'full_domain', [], [], [], DLPreprocessParam)
+
+* Preprocess dataset
+create_dict (PreprocessGenParam)
+set_dict_tuple (PreprocessGenParam, 'overwrite_files', OverwritePreprocess)
+preprocess_dl_dataset (DatasetHandle, PreprocessDir, DLPreprocessParam, PreprocessGenParam, DLDatasetFileName)
+
+* Load preprocessed dataset
+read_dict (DLDatasetFileName, [], [], DLDataset)
+
+* ---------------------------------------------
+* Split dataset into train / val / test
+create_dict (SplitGenParam)
+set_dict_tuple (SplitGenParam, 'overwrite_split', 'true')
+split_dl_dataset (DLDataset, TrainingPercent, ValidationPercent, SplitGenParam)
+
+* ---------------------------------------------
+* Create training parameters
+create_dl_train_param (DLModelHandle, NumEpochs, 1, EnableDisplay, RandomSeed, [], [], TrainParam)
+
+* Train model
+train_dl_model (DLDataset, DLModelHandle, TrainParam, 0, TrainResults, TrainInfos, EvaluationInfos)
+
+* Save final model
+FinalModelFile := ModelOutDir + '/final_model.hdl'
+write_dl_model (DLModelHandle, FinalModelFile)
+
+* ---------------------------------------------
+* Evaluate on test split
+evaluate_dl_model (DLDataset, DLModelHandle, 'split', 'test', [], EvaluationResult, EvalParams)
+
+* Save evaluation results
+write_dict (EvaluationResult, EvaluationResultFile, [], [])
+
+* ---------------------------------------------
+* End of script 
