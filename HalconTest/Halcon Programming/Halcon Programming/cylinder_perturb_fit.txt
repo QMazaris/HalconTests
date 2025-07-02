@@ -5,15 +5,17 @@
 dev_update_off()
 dev_close_window()
 
-* Parameters
+* Parameters for high fidelity test rectangle
 Radius := 0.05
-CylinderHeight := 0.1
-PerturbationStdDev := 0.001
-NumPointsCircumference := 100
-NumPointsHeight := 50
-STLFileName := 'cylinder_50mm.stl'
+CylinderHeight := 0.02
+PerturbationStdDev := 0.0005
+NumPointsCircumference := 200
+NumPointsHeight := 100
+AngleStart := 0.0
+AngleEnd := 1.57079632679
+STLFileName := 'C:/Users/QuinnMazaris/Downloads/cylinder.stl'
 
-* Step 1: Create ideal cylindrical surface points
+* Step 1: Create ideal cylindrical surface points (test rectangle section)
 X := []
 Y := []
 Z := []
@@ -21,7 +23,8 @@ Z := []
 for i := 0 to NumPointsHeight - 1 by 1
     ZCoord := (real(i) / real(NumPointsHeight - 1)) * CylinderHeight - CylinderHeight/2
     for j := 0 to NumPointsCircumference - 1 by 1
-        Angle := (real(j) / real(NumPointsCircumference)) * 2 * 3.14159265359
+        * Create rectangular section (90 degrees) with higher density
+        Angle := AngleStart + (real(j) / real(NumPointsCircumference - 1)) * (AngleEnd - AngleStart)
         XCoord := Radius * cos(Angle)
         YCoord := Radius * sin(Angle)
         
@@ -50,9 +53,20 @@ for i := 0 to |X| - 1 by 1
     NoiseY := PerturbationStdDev * (RandomY[i] - 0.5) * 2.449
     NoiseZ := PerturbationStdDev * (RandomZ[i] - 0.5) * 2.449
     
-    * Add perturbations with gaussian shape influence
-    DistFromCenter := sqrt(X[i]*X[i] + Y[i]*Y[i])
-    GaussianWeight := exp(-((DistFromCenter - Radius)*(DistFromCenter - Radius))/(2*0.01*0.01))
+    * Add perturbations with localized gaussian influence
+    * Create perturbation center at middle of test rectangle  
+    CenterAngle := (AngleStart + AngleEnd) / 2
+    CenterX := Radius * cos(CenterAngle)
+    CenterY := Radius * sin(CenterAngle)
+    CenterZ := 0.0
+    
+    * Distance from perturbation center
+    DistFromPerturbCenter := sqrt((X[i] - CenterX)*(X[i] - CenterX) + \
+                                  (Y[i] - CenterY)*(Y[i] - CenterY) + \
+                                  (Z[i] - CenterZ)*(Z[i] - CenterZ))
+    
+    * Gaussian weight based on distance from perturbation center
+    GaussianWeight := exp(-(DistFromPerturbCenter*DistFromPerturbCenter)/(2*0.008*0.008))
     
     PertX := X[i] + NoiseX * GaussianWeight
     PertY := Y[i] + NoiseY * GaussianWeight  
@@ -133,13 +147,15 @@ write_string(WindowHandle, 'Std Dev: ' + StdDevDistance$'.4f' + ' m')
 
 * Step 14: Write results to file
 open_file('cylinder_analysis_results.txt', 'output', FileHandle)
-fwrite_string(FileHandle, 'Cylinder Surface Analysis Results\n')
-fwrite_string(FileHandle, '================================\n\n')
+fwrite_string(FileHandle, 'High Fidelity Cylinder Test Rectangle Analysis\n')
+fwrite_string(FileHandle, '=============================================\n\n')
 fwrite_string(FileHandle, 'Parameters:\n')
 fwrite_string(FileHandle, 'Target Radius: ' + Radius$'.6f' + ' m\n')
-fwrite_string(FileHandle, 'Cylinder Height: ' + CylinderHeight$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Test Rectangle Height: ' + CylinderHeight$'.6f' + ' m\n')
+fwrite_string(FileHandle, 'Angular Range: ' + (AngleEnd - AngleStart)$'.3f' + ' rad (90 degrees)\n')
 fwrite_string(FileHandle, 'Perturbation Std Dev: ' + PerturbationStdDev$'.6f' + ' m\n')
-fwrite_string(FileHandle, 'Number of Points: ' + |PerturbedX| + '\n\n')
+fwrite_string(FileHandle, 'Number of Points: ' + |PerturbedX| + '\n')
+fwrite_string(FileHandle, 'Point Density: ' + (|PerturbedX| / (CylinderHeight * (AngleEnd - AngleStart) * Radius))$'.0f' + ' points/m²\n\n')
 
 fwrite_string(FileHandle, 'Fitted Cylinder Parameters:\n')
 fwrite_string(FileHandle, 'Fitted Radius: ' + FittedRadius$'.6f' + ' m\n')
@@ -168,8 +184,10 @@ write_object_model_3d(FittedCylinder, 'ply', 'fitted_cylinder.ply', [], [])
 * Step 16: Clean up memory
 clear_object_model_3d([IdealCylinder, PerturbedCylinder, CADCylinder, FittedCylinder])
 
-* Display completion message
-dev_disp_text('Analysis complete. Results saved to cylinder_analysis_results.txt', \
+* Display completion message  
+dev_disp_text('High fidelity test rectangle analysis complete.', \
+              'window', 'bottom', 'left', 'black', [], [])
+dev_disp_text('Results saved to cylinder_analysis_results.txt', \
               'window', 'bottom', 'left', 'black', [], [])
 
 stop() 
