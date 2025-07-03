@@ -34,5 +34,9 @@
   {
     "type": "sqlite",
     "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\combined.db"
+  },
+  {
+    "type": "sqlite",
+    "path": "c:\\Users\\QuinnMazaris\\Documents\\HalconTests\\HalconTest\\halcon_chunks_20250703_113244.db"
   }
 ]
