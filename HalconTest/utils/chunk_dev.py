@@ -56,6 +56,7 @@ import re
 import hashlib
 import sqlite3
 import datetime
+import csv
 from fnmatch import fnmatch
 from typing import Dict, List, Generator, Optional, Set, Tuple
 
@@ -177,6 +178,63 @@ def generate_db_name() -> str:
 
 
 ############################################################
+# CSV export functions for debugging
+############################################################
+
+def write_contexts_to_csv(contexts: List[Dict[str, str]], csv_path: str) -> None:
+    """Write contexts data to CSV file for debugging."""
+    try:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            if not contexts:
+                print(f"No contexts to write to {csv_path}")
+                return
+                
+            fieldnames = ['id', 'file', 'procedure', 'header', 'tags']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for context in contexts:
+                # Truncate long header for readability in CSV
+                context_copy = context.copy()
+                if context_copy.get('header') and len(context_copy['header']) > 200:
+                    context_copy['header'] = context_copy['header'][:200] + '...'
+                writer.writerow(context_copy)
+                
+        print(f"✅ Wrote {len(contexts)} contexts to {csv_path}")
+    except Exception as e:
+        print(f"❌ Error writing contexts to CSV: {e}")
+
+
+def write_chunks_to_csv(chunks: List[Dict[str, str]], csv_path: str) -> None:
+    """Write chunks data to CSV file for debugging."""
+    try:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            if not chunks:
+                print(f"No chunks to write to {csv_path}")
+                return
+                
+            fieldnames = ['context_id', 'chunk_type', 'sequence', 'description', 'code', 
+                         'line_start', 'line_end', 'injected_context']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for chunk in chunks:
+                # Truncate long fields for readability in CSV
+                chunk_copy = chunk.copy()
+                if chunk_copy.get('description') and len(chunk_copy['description']) > 100:
+                    chunk_copy['description'] = chunk_copy['description'][:100] + '...'
+                if chunk_copy.get('code') and len(chunk_copy['code']) > 300:
+                    chunk_copy['code'] = chunk_copy['code'][:300] + '...'
+                if chunk_copy.get('injected_context') and len(chunk_copy['injected_context']) > 200:
+                    chunk_copy['injected_context'] = chunk_copy['injected_context'][:200] + '...'
+                writer.writerow(chunk_copy)
+                
+        print(f"✅ Wrote {len(chunks)} chunks to {csv_path}")
+    except Exception as e:
+        print(f"❌ Error writing chunks to CSV: {e}")
+
+
+############################################################
 # Helper functions
 ############################################################
 
@@ -277,6 +335,7 @@ def extract_file_context(path: str) -> Dict[str, str]:
         lines = content.split('\n')
         header_lines = []
         in_body = False
+        found_first_code = False
         
         for line in lines:
             stripped = line.strip()
@@ -286,19 +345,38 @@ def extract_file_context(path: str) -> Dict[str, str]:
                 in_body = True
                 continue
             
-            # Only collect comments that are in the body section
-            if in_body and stripped.startswith('<c>*'):
-                # Clean up the comment
-                clean_comment = TAG_RE.sub("", stripped).strip()
-                clean_comment = clean_comment.lstrip('*').strip()
-                if clean_comment and not clean_comment.startswith('---'):
-                    header_lines.append(clean_comment)
+            # Only process lines in the body section
+            if not in_body:
+                continue
+                
+            # Check if this is a comment line
+            if stripped.startswith('<c>'):
+                # Extract the comment content by removing XML tags
+                comment_content = TAG_RE.sub("", stripped).strip()
+                
+                # Remove leading asterisk and clean up
+                if comment_content.startswith('*'):
+                    comment_content = comment_content[1:].strip()
+                
+                # Skip empty comments and separator lines
+                if comment_content and not re.match(r'^[-\s=_]{3,}$', comment_content):
+                    header_lines.append(comment_content)
             
-            # Stop collecting header when we hit the first code line
-            elif in_body and stripped.startswith('<l>'):
+            # Check if this is a code line - stop collecting header after first code line  
+            elif stripped.startswith('<l>'):
+                found_first_code = True
                 break
         
-        context["header"] = " ".join(header_lines).strip()
+        # Join header lines with spaces, but preserve some structure for multi-line descriptions
+        if header_lines:
+            # Clean up and join the header lines
+            cleaned_lines = []
+            for line in header_lines:
+                line = line.strip()
+                if line:
+                    cleaned_lines.append(line)
+            
+            context["header"] = " ".join(cleaned_lines)
         
         # Extract tags from file extension and version info
         file_ext = os.path.splitext(path)[1].lstrip(".")
@@ -767,12 +845,22 @@ def run_database_mode(available_files: List[str], root_path: str) -> None:
     # Generate unique database name
     db_path = generate_db_name()
     
+    # Generate CSV file names for debugging
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    contexts_csv = f"contexts_debug_{timestamp}.csv"
+    chunks_csv = f"chunks_debug_{timestamp}.csv"
+    
     print(f"\n🚀 Starting database creation...")
     print(f"📁 Processing {len(available_files)} files")
     print(f"💾 Database: {db_path}")
+    print(f"📄 Debug CSV files: {contexts_csv}, {chunks_csv}")
     
     # Create database
     conn = create_database(db_path)
+    
+    # Lists to collect data for CSV export
+    all_contexts = []
+    all_chunks = []
     
     total_contexts = 0
     total_chunks = 0
@@ -794,19 +882,25 @@ def run_database_mode(available_files: List[str], root_path: str) -> None:
                 clear_global_state()
                 
                 # Process file
-                file_context, all_chunks = process_file_for_database(file_path)
+                file_context, file_chunks = process_file_for_database(file_path)
                 
                 # Insert into database
                 insert_context(conn, file_context)
                 total_contexts += 1
                 
-                for chunk in all_chunks:
+                # Add to CSV collection
+                all_contexts.append(file_context)
+                
+                for chunk in file_chunks:
                     insert_chunk(conn, chunk)
                     total_chunks += 1
                     if chunk['chunk_type'] == 'full':
                         total_full_chunks += 1
                     else:
                         total_micro_chunks += 1
+                
+                # Add chunks to CSV collection
+                all_chunks.extend(file_chunks)
                 
                 processed_files += 1
                 
@@ -822,11 +916,17 @@ def run_database_mode(available_files: List[str], root_path: str) -> None:
     finally:
         conn.close()
     
+    # Write CSV files for debugging
+    print(f"\n📄 Writing CSV debug files...")
+    write_contexts_to_csv(all_contexts, contexts_csv)
+    write_chunks_to_csv(all_chunks, chunks_csv)
+    
     # Final summary
     print(f"\n{'='*60}")
     print(f"🎉 DATABASE CREATION COMPLETE!")
     print(f"{'='*60}")
     print(f"📄 Database: {db_path}")
+    print(f"📄 CSV files: {contexts_csv}, {chunks_csv}")
     print(f"📁 Files processed: {processed_files}/{len(available_files)}")
     print(f"❌ Errors: {errors}")
     print(f"📊 Total contexts: {total_contexts}")
