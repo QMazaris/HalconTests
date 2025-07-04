@@ -19,7 +19,7 @@ uv run HalconTest.py
 uv sync --extra web
 
 # Run web chat interface
-python halcon_chat_app.py
+python tests/halcon_chat_app.py
 # Open browser to: http://localhost:5000
 ```
 
@@ -56,21 +56,26 @@ uv sync --extra "web,build"
 ### 1. MCP Server (`HalconTest.py`)
 - **Purpose:** Model Context Protocol server for Claude Desktop integration
 - **Features:** 
-  - Semantic search for HALCON operators
-  - Code example search
-  - Operator documentation lookup
-  - Real-time database validation
+  - **Unified Operator Search** - Automatically chooses exact or semantic search
+  - **Unified Code Search** - Searches examples and intelligent code chunks
+  - **Smart Auto-Detection** - Understands user intent from natural language
+  - **Navigation Support** - Browse related code chunks with context
+  - **Real-time database validation**
+- **Endpoints:**
+  - `search_operators()` - Unified operator search (replaces `get_halcon_operator` + `semantic_match`)
+  - `search_code()` - Unified code search (replaces `semantic_code_search` + `enhanced_chunk_search`)
+  - `list_halcon_operators()` - Browse operators with pagination
 - **Usage:** `uv run HalconTest.py`
 
-### 2. Web Chat Interface (`halcon_chat_app.py`)
+### 2. Web Chat Interface (`tests/halcon_chat_app.py`)
 - **Purpose:** ChatGPT-style web interface for interactive queries
 - **Features:**
-  - Natural language queries
+  - Natural language queries with intelligent routing
   - Search type control with commands
   - Beautiful responsive UI
   - Real-time typing indicators
 - **Requirements:** `--extra web` dependencies
-- **Usage:** `python halcon_chat_app.py`
+- **Usage:** `python tests/halcon_chat_app.py`
 
 ### 3. Database Builders
 - **`build_semantic_indices.py`** - Pre-builds FAISS vector indices
@@ -121,19 +126,22 @@ The system automatically detects search intent:
 ```
 HalconTest/
 ├── pyproject.toml                    # Project configuration with optional deps
-├── HalconTest.py                     # Core MCP server
-├── halcon_chat_app.py               # Web interface (requires --extra web)
+├── HalconTest.py                     # Core MCP server with unified endpoints
 ├── build_semantic_indices.py        # FAISS index builder
-├── combined.db                       # Operators database
-├── halcon_code_examplesV2.db        # Code examples database
-├── halcon_operators.faiss           # Pre-built operator embeddings
-├── halcon_code_examples.faiss       # Pre-built code embeddings
-├── templates/chat.html              # Web interface template
-├── static/style.css                 # Web interface styling
-├── static/script.js                 # Web interface functionality
-└── utils/                           # Database building utilities
+├── databases/                        # 📁 All databases and indices organized
+│   ├── combined.db                   # Operators database
+│   ├── halcon_code_examplesV2.db     # Code examples database
+│   ├── halcon_chunks_latest.db       # Intelligent code chunks database
+│   ├── halcon_operators.faiss        # Pre-built operator embeddings
+│   ├── halcon_code_examples.faiss    # Pre-built code embeddings
+│   └── *.pkl                         # Metadata files for indices
+├── tests/                            # 🧪 Testing and frontend components
+│   ├── halcon_chat_app.py           # Web interface (requires --extra web)
+│   └── test_mcp_search.py           # Interactive MCP server tester
+└── utils/                            # 🔧 Database building utilities
     ├── build_halcon_db.py           # Operator database builder
     ├── chunk_scanner_cli.py         # Code example extractor
+    ├── chunk_dev.py                 # Advanced chunking development
     ├── scrapy.py                    # Web scraper
     └── dataExtractor.py             # HTML parser
 ```
@@ -157,11 +165,14 @@ python build_semantic_indices.py
 
 ### Testing
 ```bash
-# Test MCP server functions
-python test_mcp_search.py
+# Test MCP server functions with new unified endpoints
+python tests/test_mcp_search.py
 
-# Test semantic search directly
-python -c "from HalconTest import semantic_match; print(semantic_match('edge detection'))"
+# Test unified operator search directly
+python -c "from HalconTest import search_operators; print(search_operators('edge detection'))"
+
+# Test unified code search directly  
+python -c "from HalconTest import search_code; print(search_code('blob analysis examples'))"
 ```
 
 ## 🌐 Web Interface Features
@@ -177,9 +188,10 @@ python -c "from HalconTest import semantic_match; print(semantic_match('edge det
 ## 🔧 Configuration
 
 ### Environment Variables
-- `HALCON_DB_PATH` - Path to operators database (default: `combined.db`)
-- `HALCON_CODE_DB_PATH` - Path to code examples database (default: `halcon_code_examplesV2.db`)
-- `HALCON_EMBED_MODEL` - Sentence transformer model (default: `all-MiniLM-L6-v2`)
+- `HALCON_DB_PATH` - Path to operators database (default: `databases/combined.db`)
+- `HALCON_CODE_DB_PATH` - Path to code examples database (default: `databases/halcon_code_examplesV2.db`)
+- `HALCON_CHUNK_DB_PATH` - Path to code chunks database (default: `databases/halcon_chunks_latest.db`)
+- `HALCON_EMBED_MODEL` - Sentence transformer model (default: `microsoft/codebert-base`)
 
 ### Performance Tuning
 - **FAISS Quantization:** Enabled for datasets >500 vectors
@@ -243,8 +255,8 @@ This project provides educational access to HALCON documentation and examples. E
 
 **"Database not found"**
 ```bash
-# Ensure databases exist
-ls -la *.db
+# Ensure databases exist in new organized structure
+ls -la databases/*.db
 
 # Rebuild if needed
 python utils/build_halcon_db.py
@@ -254,16 +266,20 @@ python utils/build_halcon_db.py
 ```bash
 # Install web dependencies
 uv sync --extra web
+
+# Run web interface from correct location
+python tests/halcon_chat_app.py
 ```
 
 **Slow search performance**
 ```bash
-# Rebuild FAISS indices
+# Rebuild FAISS indices (now stored in databases/ folder)
 python build_semantic_indices.py
 ```
 
 ### Getting Help
-1. Check that all required databases exist
+1. Check that all required databases exist in the `databases/` folder
 2. Verify dependencies with `uv sync --extra web`
-3. Test core functionality with `python test_mcp_search.py`
-4. Check logs for detailed error messages 
+3. Test core functionality with `python tests/test_mcp_search.py`
+4. Try the new unified endpoints: `search_operators()` and `search_code()`
+5. Check logs for detailed error messages 

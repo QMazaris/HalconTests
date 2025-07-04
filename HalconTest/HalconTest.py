@@ -9,24 +9,31 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from contextlib import contextmanager
+import subprocess
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
 # Configuration Constants
-DB_PATH = Path(os.getenv("HALCON_DB_PATH", Path(__file__).with_name("combined.db")))
-CODE_DB_PATH = Path(os.getenv("HALCON_CODE_DB_PATH", Path(__file__).with_name("halcon_code_examplesV2.db")))
-CHUNK_DB_PATH = Path(os.getenv("HALCON_CHUNK_DB_PATH", Path(__file__).with_name("halcon_chunks_latest.db")))
+SCRIPT_DIR = Path(__file__).parent
+DB_DIR = SCRIPT_DIR / "databases"
+DB_PATH = Path(os.getenv("HALCON_DB_PATH", DB_DIR / "combined.db"))
+CHUNK_DB_PATH = Path(os.getenv("HALCON_CHUNK_DB_PATH", DB_DIR / "halcon_chunks_latest.db"))
 
-# Pre-built index paths
-OPERATOR_INDEX_PATH = Path(__file__).with_name("halcon_operators.faiss")
-OPERATOR_META_PATH = Path(__file__).with_name("halcon_operators_meta.pkl")
-CODE_INDEX_PATH = Path(__file__).with_name("halcon_code_examples.faiss")
-CODE_META_PATH = Path(__file__).with_name("halcon_code_examples_meta.pkl")
-CHUNK_INDEX_PATH = Path(__file__).with_name("halcon_chunks.faiss")
-CHUNK_META_PATH = Path(__file__).with_name("halcon_chunks_meta.pkl")
+# Pre-built index paths (also in databases folder)
+OPERATOR_INDEX_PATH = DB_DIR / "halcon_operators.faiss"
+OPERATOR_META_PATH = DB_DIR / "halcon_operators_meta.pkl"
+CHUNK_INDEX_PATH = DB_DIR / "halcon_chunks.faiss"
+CHUNK_META_PATH = DB_DIR / "halcon_chunks_meta.pkl"
 
-# Semantic search configuration  
-SEMANTIC_MODEL_NAME = os.getenv("HALCON_EMBED_MODEL", "microsoft/codebert-base")
+# New index paths for separated chunk types
+FULL_CHUNK_INDEX_PATH = DB_DIR / "halcon_chunks_full.faiss"
+FULL_CHUNK_META_PATH = DB_DIR / "halcon_chunks_full_meta.pkl"
+MICRO_CHUNK_INDEX_PATH = DB_DIR / "halcon_chunks_micro.faiss"
+MICRO_CHUNK_META_PATH = DB_DIR / "halcon_chunks_micro_meta.pkl"
+
+# Semantic search configuration
+SEMANTIC_MODEL_NAME = os.getenv("HALCON_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 TOP_K_DEFAULT = 5
 USE_QUANTIZATION = True
 QUANTIZATION_BITS = 8
@@ -42,27 +49,17 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 _embedding_model = None
 _faiss_index = None
 _operator_meta = None
-_code_index = None
-_code_meta = None
-_chunk_index = None
-_chunk_meta = None
+_full_chunk_index = None
+_full_chunk_meta = None
+_micro_chunk_index = None
+_micro_chunk_meta = None
+_build_script_was_run = False
 
 
 @contextmanager
 def get_connection():
     """Context manager for database connections."""
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    try:
-        yield con
-    finally:
-        con.close()
-
-
-@contextmanager
-def get_code_connection():
-    """Context manager for code database connections."""
-    con = sqlite3.connect(CODE_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     try:
         yield con
@@ -110,33 +107,6 @@ def validate_database() -> None:
             logging.exception("Failed to query operator database: %s", exc)
             raise
 
-    # Validate Code Examples Database
-    if not CODE_DB_PATH.exists():
-        logging.error("Code examples database file not found at %s", CODE_DB_PATH)
-        raise FileNotFoundError(f"Code examples database not found: {CODE_DB_PATH}")
-
-    with get_code_connection() as con:
-        try:
-            cur = con.cursor()
-            count = cur.execute("SELECT COUNT(*) FROM examples").fetchone()[0]
-            logging.info("Code examples database connected: %d examples available", count)
-
-            # Check schema
-            columns = cur.execute("PRAGMA table_info(examples)").fetchall()
-            col_names = [col[1] for col in columns]
-            required_cols = ['title', 'description', 'code', 'tags']
-
-            for col in required_cols:
-                if col not in col_names:
-                    logging.error("Missing required column in examples table: %s", col)
-                    raise ValueError(f"Database schema missing column: {col}")
-            
-            logging.info("Code examples database schema validated successfully")
-
-        except Exception as exc:
-            logging.exception("Failed to query code examples database: %s", exc)
-            raise
-
     # Validate Chunk Database (optional - may not exist if chunks haven't been generated)
     if CHUNK_DB_PATH.exists():
         with get_chunk_connection() as con:
@@ -180,26 +150,41 @@ def validate_database() -> None:
         logging.info("Chunk database not found - chunk search features will be unavailable")
 
 
-def _build_faiss_index(embeddings: np.ndarray, use_quantization: bool = True) -> faiss.Index:
-    """Build optimized FAISS index based on dataset size and settings."""
-    dim = embeddings.shape[1]
-    n_vectors = len(embeddings)
+def _run_build_script() -> bool:
+    """Run the build_semantic_indices.py script if it hasn't been run yet."""
+    global _build_script_was_run
+    if _build_script_was_run:
+        logging.error("Build script was already run, but required index files are still missing.")
+        return False
+
+    build_script_path = SCRIPT_DIR / "build_semantic_indices.py"
+    if not build_script_path.exists():
+        logging.error("Build script not found at %s", build_script_path)
+        raise FileNotFoundError(f"Build script not found: {build_script_path}")
     
-    if use_quantization and n_vectors > 500:
-        # Use IVF (Inverted File) with inner product for cosine similarity on normalized vectors
-        n_centroids = min(max(int(np.sqrt(n_vectors)), 50), n_vectors // 10)
-        index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, n_centroids, faiss.METRIC_INNER_PRODUCT)
-        index.train(embeddings.astype(np.float32))
-        index.add(embeddings.astype(np.float32))
-        index.nprobe = NPROBE
-        logging.info("Built quantized IVF index with %d centroids", n_centroids)
-    else:
-        # Use flat index for small datasets or exact search
-        index = faiss.IndexFlatIP(dim)
-        index.add(embeddings.astype(np.float32))
-        logging.info("Built flat index for exact search")
-    
-    return index
+    logging.info("Attempting to build indices by running %s...", build_script_path.name)
+    try:
+        # Use sys.executable to ensure we run with the same Python interpreter
+        result = subprocess.run(
+            [sys.executable, str(build_script_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        logging.info("Build script completed successfully.")
+        logging.debug("Build script output:\n%s", result.stdout)
+        _build_script_was_run = True
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error("Failed to build semantic indices. Script exited with error.")
+        logging.error("STDOUT:\n%s", e.stdout)
+        logging.error("STDERR:\n%s", e.stderr)
+        _build_script_was_run = True  # Mark as run even on failure to prevent loops
+        return False
+    except FileNotFoundError:
+        logging.error("Failed to run build script. Is Python installed and in the system's PATH?")
+        return False
 
 
 def _ensure_embedding_model() -> None:
@@ -213,7 +198,7 @@ def _embed_text(text: str, is_query: bool = False) -> np.ndarray:
     """Embed text optimized for the selected model."""
     _ensure_embedding_model()
     
-    # CodeBERT and most other models don't need special prefixes
+
     embedding = _embedding_model.encode([text], convert_to_numpy=True)
     return embedding / np.linalg.norm(embedding)  # Normalize for cosine similarity
 
@@ -242,289 +227,77 @@ def _ensure_semantic_index() -> None:
             logging.info("Pre-built index loaded with %d operator embeddings", len(_operator_meta))
             return
         except Exception as e:
-            logging.warning("Failed to load pre-built index, rebuilding: %s", e)
+            logging.warning("Failed to load pre-built index, will attempt to rebuild: %s", e)
 
-    # Build index from scratch
-    logging.info("Building semantic embedding index for HALCON operators...")
-    _ensure_embedding_model()
-
-    # Fetch operator data
-    with get_connection() as con:
-        cur = con.cursor()
-        rows = cur.execute(
-            "SELECT name, description, signature, url, parameters, results FROM operators"
-        ).fetchall()
-
-        texts: list[str] = []
-        _operator_meta = []
-
-        for row in rows:
-            # Combine multiple fields for better search
-            text_parts = []
-            if row["name"]:
-                text_parts.append(row["name"])
-            if row["description"]:
-                text_parts.append(row["description"])
-            if row["signature"]:
-                text_parts.append(row["signature"])
-            
-            text = " ".join(text_parts) if text_parts else "No description available"
-            texts.append(text)
-            _operator_meta.append(
-                {
-                    "name": row["name"],
-                    "description": row["description"] or "No description available",
-                    "signature": row["signature"],
-                    "url": row["url"],
-                    "parameters": row["parameters"],
-                    "results": row["results"],
-                }
-            )
-
-    # Compute embeddings in batches for better performance
-    logging.info("Computing embeddings for %d operators...", len(texts))
-    embeddings = _embedding_model.encode(
-        texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True
-    )
-    
-    # Normalize to unit length for cosine similarity
-    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-    _faiss_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
-    logging.info("Semantic index built with %d operator embeddings", len(texts))
-
-    # Save index for future runs
-    try:
-        logging.info("Saving semantic index for operators to %s", OPERATOR_INDEX_PATH)
-        faiss.write_index(_faiss_index, str(OPERATOR_INDEX_PATH))
-        with open(OPERATOR_META_PATH, 'wb') as f:
-            pickle.dump(_operator_meta, f)
-        logging.info("Operator index saved successfully.")
-    except Exception as e:
-        logging.warning("Could not save operator index: %s", e)
+    # If loading fails or files don't exist, run the build script
+    logging.warning("Operator index not found or failed to load. Attempting to build all indices...")
+    if _run_build_script():
+        if _faiss_index is None: # Check if another thread already loaded it
+             _ensure_semantic_index() # Recursive call to retry loading
+    else:
+        raise RuntimeError("Failed to build and load operator semantic index.")
 
 
-def _ensure_code_index() -> None:
-    """Load or build the FAISS index with embeddings of code examples."""
-    global _code_index, _code_meta
+def _ensure_full_chunk_index() -> None:
+    """Load or build the FAISS index for FULL chunks (chunk_type='full')."""
+    global _full_chunk_index, _full_chunk_meta
 
-    if _code_index is not None:
+    if _full_chunk_index is not None:
         return  # Already loaded
 
     # Try to load pre-built index first
-    if CODE_INDEX_PATH.exists() and CODE_META_PATH.exists():
-        logging.info("Loading pre-built semantic index for HALCON code examples...")
+    if FULL_CHUNK_INDEX_PATH.exists() and FULL_CHUNK_META_PATH.exists():
+        logging.info("Loading pre-built semantic index for HALCON FULL code chunks…")
         try:
-            _code_index = faiss.read_index(str(CODE_INDEX_PATH))
-            with open(CODE_META_PATH, 'rb') as f:
-                _code_meta = pickle.load(f)
-            
+            _full_chunk_index = faiss.read_index(str(FULL_CHUNK_INDEX_PATH))
+            with open(FULL_CHUNK_META_PATH, 'rb') as f:
+                _full_chunk_meta = pickle.load(f)
             _ensure_embedding_model()
-            
-            # Set nprobe for quantized indices
-            if hasattr(_code_index, 'nprobe'):
-                _code_index.nprobe = NPROBE
-                
-            logging.info("Pre-built code index loaded with %d example embeddings", len(_code_meta))
+            if hasattr(_full_chunk_index, 'nprobe'):
+                _full_chunk_index.nprobe = NPROBE
+            logging.info("Pre-built FULL chunk index loaded with %d embeddings", len(_full_chunk_meta))
             return
         except Exception as e:
-            logging.warning("Failed to load pre-built code index, rebuilding: %s", e)
+            logging.warning("Failed to load FULL chunk index, will attempt to rebuild: %s", e)
 
-    # Build index from scratch
-    logging.info("Building semantic embedding index for HALCON code examples...")
-    _ensure_embedding_model()
-
-    # Fetch code example data
-    with get_code_connection() as con:
-        cur = con.cursor()
-        rows = cur.execute(
-            "SELECT title, description, code, tags FROM examples"
-        ).fetchall()
-
-        texts: list[str] = []
-        _code_meta = []
-
-        for row in rows:
-            # Combine available textual fields for embedding, including a code snippet
-            code_snippet = (row["code"] or "")[:400]  # Increased for better context
-            text_parts = []
-            if row["title"]:
-                text_parts.append(row["title"])
-            if row["description"]:
-                text_parts.append(row["description"])
-            if code_snippet:
-                text_parts.append(code_snippet)
-            if row["tags"]:
-                text_parts.append(row["tags"])
-            
-            text = " ".join(text_parts).strip() if text_parts else "No content available"
-            texts.append(text)
-            _code_meta.append(
-                {
-                    "title": row["title"],
-                    "description": row["description"],
-                    "code": row["code"],
-                    "tags": row["tags"],
-                }
-            )
-
-    # Compute embeddings in batches for better performance
-    logging.info("Computing embeddings for %d code examples...", len(texts))
-    embeddings = _embedding_model.encode(
-        texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True
-    )
-    
-    # Normalize to unit length for cosine similarity
-    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-    _code_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
-    logging.info("Semantic index built with %d code example embeddings", len(texts))
-
-    # Save index for future runs
-    try:
-        logging.info("Saving semantic index for code examples to %s", CODE_INDEX_PATH)
-        faiss.write_index(_code_index, str(CODE_INDEX_PATH))
-        with open(CODE_META_PATH, 'wb') as f:
-            pickle.dump(_code_meta, f)
-        logging.info("Code example index saved successfully.")
-    except Exception as e:
-        logging.warning("Could not save code example index: %s", e)
+    # If loading fails or files don't exist, run the build script
+    logging.warning("FULL chunk index not found or failed to load. Attempting to build all indices...")
+    if _run_build_script():
+        if _full_chunk_index is None:
+            _ensure_full_chunk_index() # Recursive call
+    else:
+        raise RuntimeError("Failed to build and load FULL chunk semantic index.")
 
 
-def _ensure_chunk_index() -> None:
-    """Load or build the FAISS index with embeddings of code chunks."""
-    global _chunk_index, _chunk_meta
+def _ensure_micro_chunk_index() -> None:
+    """Load or build the FAISS index for MICRO chunks (chunk_type='micro')."""
+    global _micro_chunk_index, _micro_chunk_meta
 
-    if _chunk_index is not None:
+    if _micro_chunk_index is not None:
         return  # Already loaded
 
-    # Check if chunk database exists
-    if not CHUNK_DB_PATH.exists():
-        logging.warning("Chunk database not found - chunk search unavailable")
-        return
-
     # Try to load pre-built index first
-    if CHUNK_INDEX_PATH.exists() and CHUNK_META_PATH.exists():
-        logging.info("Loading pre-built semantic index for HALCON code chunks...")
+    if MICRO_CHUNK_INDEX_PATH.exists() and MICRO_CHUNK_META_PATH.exists():
+        logging.info("Loading pre-built semantic index for HALCON MICRO code chunks…")
         try:
-            _chunk_index = faiss.read_index(str(CHUNK_INDEX_PATH))
-            with open(CHUNK_META_PATH, 'rb') as f:
-                _chunk_meta = pickle.load(f)
-            
+            _micro_chunk_index = faiss.read_index(str(MICRO_CHUNK_INDEX_PATH))
+            with open(MICRO_CHUNK_META_PATH, 'rb') as f:
+                _micro_chunk_meta = pickle.load(f)
             _ensure_embedding_model()
-            
-            # Set nprobe for quantized indices
-            if hasattr(_chunk_index, 'nprobe'):
-                _chunk_index.nprobe = NPROBE
-                
-            logging.info("Pre-built chunk index loaded with %d chunk embeddings", len(_chunk_meta))
+            if hasattr(_micro_chunk_index, 'nprobe'):
+                _micro_chunk_index.nprobe = NPROBE
+            logging.info("Pre-built MICRO chunk index loaded with %d embeddings", len(_micro_chunk_meta))
             return
         except Exception as e:
-            logging.warning("Failed to load pre-built chunk index, rebuilding: %s", e)
+            logging.warning("Failed to load MICRO chunk index, will attempt to rebuild: %s", e)
 
-    # Build index from scratch
-    logging.info("Building semantic embedding index for HALCON code chunks...")
-    _ensure_embedding_model()
-
-    # Fetch chunk data with context information
-    with get_chunk_connection() as con:
-        cur = con.cursor()
-        
-        # Join chunks with contexts to get file information
-        rows = cur.execute("""
-            SELECT 
-                c.id as chunk_id,
-                c.context_id, 
-                c.chunk_type, 
-                c.sequence, 
-                c.description, 
-                c.code, 
-                c.line_start, 
-                c.line_end, 
-                c.injected_context,
-                ctx.file,
-                ctx.procedure,
-                ctx.header,
-                ctx.tags
-            FROM chunks c
-            JOIN contexts ctx ON c.context_id = ctx.id
-            ORDER BY c.context_id, c.sequence
-        """).fetchall()
-
-        if not rows:
-            logging.warning("No chunks found in database")
-            return
-
-        texts: list[str] = []
-        _chunk_meta = []
-
-        for row in rows:
-            # Combine fields for embedding - prioritize code but include context
-            text_parts = []
-            
-            # Add file context first
-            if row["header"]:
-                text_parts.append(f"File: {row['header']}")
-            if row["procedure"]:
-                text_parts.append(f"Procedure: {row['procedure']}")
-                
-            # Add chunk description
-            if row["description"]:
-                text_parts.append(f"Description: {row['description']}")
-                
-            # Add the main code content
-            if row["code"]:
-                text_parts.append(f"Code: {row['code']}")
-                
-            # Add injected context if available (but truncated)
-            if row["injected_context"]:
-                context_preview = row["injected_context"][:200]
-                text_parts.append(f"Context: {context_preview}")
-                
-            # Add tags for additional context
-            if row["tags"]:
-                text_parts.append(f"Tags: {row['tags']}")
-            
-            text = " ".join(text_parts).strip() if text_parts else "No content available"
-            texts.append(text)
-            
-            _chunk_meta.append({
-                "chunk_id": row["chunk_id"],
-                "context_id": row["context_id"],
-                "chunk_type": row["chunk_type"],
-                "sequence": row["sequence"],
-                "description": row["description"],
-                "code": row["code"],
-                "line_start": row["line_start"],
-                "line_end": row["line_end"],
-                "injected_context": row["injected_context"],
-                "file": row["file"],
-                "procedure": row["procedure"],
-                "header": row["header"],
-                "tags": row["tags"]
-            })
-
-    # Compute embeddings in batches for better performance
-    logging.info("Computing embeddings for %d chunks in batches...", len(texts))
-    embeddings = _embedding_model.encode(
-        texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True
-    )
-    
-    # Normalize to unit length for cosine similarity
-    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-    _chunk_index = _build_faiss_index(embeddings, USE_QUANTIZATION)
-    logging.info("Semantic index built with %d chunk embeddings", len(texts))
-
-    # Save index for future runs
-    try:
-        logging.info("Saving semantic index for code chunks to %s", CHUNK_INDEX_PATH)
-        faiss.write_index(_chunk_index, str(CHUNK_INDEX_PATH))
-        with open(CHUNK_META_PATH, 'wb') as f:
-            pickle.dump(_chunk_meta, f)
-        logging.info("Code chunk index saved successfully.")
-    except Exception as e:
-        logging.warning("Could not save code chunk index: %s", e)
+    # If loading fails or files don't exist, run the build script
+    logging.warning("MICRO chunk index not found or failed to load. Attempting to build all indices...")
+    if _run_build_script():
+        if _micro_chunk_index is None:
+            _ensure_micro_chunk_index() # Recursive call
+    else:
+        raise RuntimeError("Failed to build and load MICRO chunk semantic index.")
 
 
 @mcp.resource("halcon://operators")
@@ -532,14 +305,6 @@ def get_operators_info() -> str:
     """Get a summary of the HALCON knowledge base, including operator, code example, and chunk counts."""
     with get_connection() as con:
         op_count = con.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
-
-    code_count = 0
-    try:
-        if CODE_DB_PATH.exists():
-            with get_code_connection() as code_con:
-                code_count = code_con.execute("SELECT COUNT(*) FROM examples").fetchone()[0]
-    except Exception:
-        pass  # It's okay if code examples are not available.
 
     chunk_info = ""
     try:
@@ -552,120 +317,24 @@ def get_operators_info() -> str:
         pass  # It's okay if chunks are not available.
 
     return (
-        f"HALCON knowledge base ready. Contains {op_count} operators, {code_count} code examples{chunk_info}. "
+        f"HALCON knowledge base ready. Contains {op_count} operators{chunk_info}. "
         "Use tools for semantic search, detailed operator lookup, and enhanced chunk search with context injection."
     )
 
 
 @mcp.tool()
-def get_halcon_operator(
-    name: str, 
-    fields: list[str] = ["name", "signature", "description", "url"]
-) -> Union[dict, str]:
-    """Get HALCON operator information with flexible field selection.
-
-    Args:
-        name: Exact name of the HALCON operator (case-insensitive)
-        fields: List of fields to return, or ["all"] to get all fields. Available fields:
-               - "name": Operator name
-               - "signature": Function signature/syntax
-               - "description": Operator description
-               - "parameters": Input parameters details
-               - "results": Output results details  
-               - "url": Documentation URL
-               Default: ["name", "signature", "description", "url"]
-
-    Returns:
-        Dictionary with requested fields, or error message if operator not found.
-    """
-    valid_fields = {"name", "signature", "description", "parameters", "results", "url"}
-    
-    if "all" in fields:
-        requested_fields = list(valid_fields)
-    else:
-        requested_fields = [f for f in fields if f in valid_fields]
-    
-    if not requested_fields:
-        return "No valid fields specified. Available fields: name, signature, description, parameters, results, url, or 'all'."
-    
-    # Build SQL query with only requested fields
-    field_str = ", ".join(requested_fields)
-    
-    with get_connection() as con:
-        cur = con.cursor()
-        
-        row = cur.execute(
-            f"SELECT {field_str} FROM operators WHERE name = ? COLLATE NOCASE", 
-            (name,)
-        ).fetchone()
-        
-        if not row:
-            return f"HALCON operator '{name}' not found"
-        
-        # Build result dictionary with only requested fields
-        result = {}
-        for field in requested_fields:
-            result[field] = row[field] if row[field] is not None else ""
-        
-        return result
-
-
-@mcp.tool()
-def list_halcon_operators(offset: int = 0, limit: int = 50) -> str:
-    """List HALCON operators with pagination.
-
-    Args:
-        offset: Number of results to skip (default: 0)
-        limit: Maximum results to return (default: 50, max: 100)
-
-    Returns:
-        Paginated list of operators.
-    """
-    with get_connection() as con:
-        cur = con.cursor()
-        
-        rows = cur.execute(
-            "SELECT name, description FROM operators ORDER BY name LIMIT ? OFFSET ?",
-            (limit, offset)
-        ).fetchall()
-        
-        total = cur.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
-        
-        result_text = f"HALCON Operators ({offset + 1}-{offset + len(rows)} of {total}):\n\n"
-        for row in rows:
-            description_preview = row["description"][:100] + "..." if row["description"] and len(row["description"]) > 100 else row["description"] or "No description available"
-            result_text += f"**{row['name']}**\n{description_preview}\n\n"
-        
-        return result_text
-
-
-@mcp.tool()
-def semantic_match(
+def search_operators(
     query: str,
-    k: int = TOP_K_DEFAULT,
-    fields: list[str] = ["name"],
-) -> list[dict]:
-    """Return top-k semantically matching HALCON operators for a natural language query. Recommended to use default fields.
-
-    Args:
-        query: Natural language search string.
-        k: Number of matches to return (default 5).
-        fields: List of fields to return, or ["all"] to get all fields. Available fields:
-               - "name": Operator name
-               - "signature": Function signature/syntax
-               - "description": Operator description
-               - "parameters": Input parameters details
-               - "results": Output results details  
-               - "url": Documentation URL
-               Default: ["name"]
-
-    Returns:
-        List of dictionaries with requested operator information and similarity score.
-    """
+    fields: list[str] = ["name", "signature", "description", "url"],
+    k: int = TOP_K_DEFAULT
+) -> Union[dict, list[dict], str]:
+    """Unified HALCON operator search: single-word exact-first, multi-word semantic-only."""
     try:
-        if not query or len(query.strip()) < 3:
-            return []
+        if not query or len(query.strip()) < 2:
+            return "Query too short. Please provide at least 2 characters."
 
+        query = query.strip()
+        
         # Validate fields
         valid_fields = {"name", "signature", "description", "parameters", "results", "url"}
         
@@ -675,11 +344,27 @@ def semantic_match(
             requested_fields = [f for f in fields if f in valid_fields]
         
         if not requested_fields:
-            return []
+            return "No valid fields specified. Available fields: name, signature, description, parameters, results, url, or 'all'."
 
+        # Decide strategy: exact-first for single-word queries, else semantic-only
+        single_word = len(query.split()) == 1
+        field_str = ", ".join(requested_fields)
+        if single_word:
+            with get_connection() as con:
+                cur = con.cursor()
+                row = cur.execute(
+                    f"SELECT {field_str} FROM operators WHERE name = ? COLLATE NOCASE",
+                    (query,)
+                ).fetchone()
+            if row:
+                result = {field: (row[field] or "") for field in requested_fields}
+                result["search_mode_used"] = "exact"
+                return result
+
+        # Semantic search (for multi-word queries or single-word fallback)
         _ensure_semantic_index()
 
-        # Embed query with proper prefix for E5 model
+        # Embed query for semantic search
         vec = _embed_text(query, is_query=True)
 
         D, I = _faiss_index.search(vec.astype(np.float32), k)
@@ -691,202 +376,241 @@ def semantic_match(
             meta = _operator_meta[idx]
             
             # Build result with requested fields plus score
-            result = {"score": float(score)}
+            result = {"score": float(score), "search_mode_used": "semantic"}
             for field in requested_fields:
                 if field in meta:
                     result[field] = meta[field]
             
             results.append(result)
 
-        return results
-    
-    except Exception as e:
-        logging.exception("Error in semantic_match: %s", e)
-        return []
-
-
-@mcp.tool()
-def semantic_code_search(
-    query: str,
-    k: int = TOP_K_DEFAULT,
-) -> list[dict]:
-    """Return top-k code example chunks matching a natural language query.
-
-    Each result contains title, description, tags, full code, and similarity score.
-    
-    Args:
-        query: Natural language search string.
-        k: Number of matches to return (default 5).
-        
-    Returns:
-        List of dictionaries with code example information and similarity score.
-    """
-    try:
-        if not query or len(query.strip()) < 3:
-            return []
-
-        _ensure_code_index()
-
-        # Embed query with proper prefix for E5 model
-        vec = _embed_text(query, is_query=True)
-
-        D, I = _code_index.search(vec.astype(np.float32), k)
-
-        results = []
-        for idx, score in zip(I[0], D[0]):
-            if idx < 0:
-                continue
-            meta = _code_meta[idx]
-            results.append({
-                "title": meta["title"],
-                "description": meta["description"],
-                "tags": meta["tags"],
-                "code": meta["code"],
-                "score": float(score),
-            })
-
-        return results
-    
-    except Exception as e:
-        logging.exception("Error in semantic_code_search: %s", e)
-        return []
-
-
-@mcp.tool()
-def enhanced_chunk_search(
-    query: str,
-    k: int = TOP_K_DEFAULT,
-    chunk_type: str = "all",  # "full", "micro", "all"
-    include_context: bool = True,
-    navigation: str = "none"  # "none", "prev", "next", "both"
-) -> list[dict]:
-    """Enhanced semantic search over HALCON code chunks with context injection and navigation.
-
-    This is the unified search function that provides:
-    - Search over intelligently chunked HALCON code
-    - Context injection for better understanding
-    - Navigation to related chunks (previous/next)
-    - Choice between full file chunks or micro chunks
-    
-    Args:
-        query: Natural language search string for finding relevant code chunks
-        k: Number of matches to return (default 5)
-        chunk_type: Type of chunks to search - "full" (complete files), "micro" (code segments), or "all"
-        include_context: Whether to include injected context in results for better understanding
-        navigation: Include navigation info - "none", "prev" (previous chunk), "next" (next chunk), "both"
-        
-    Returns:
-        List of dictionaries with chunk information, code, context, and navigation data.
-        Each result includes: chunk_id, type, description, code, file info, line numbers, 
-        and optionally injected_context and navigation links.
-    """
-    try:
-        if not query or len(query.strip()) < 3:
-            return []
-
-        _ensure_chunk_index()
-        
-        if _chunk_index is None or _chunk_meta is None:
-            return [{"error": "Chunk database not available. Please ensure chunks have been generated."}]
-
-        # Embed query with proper prefix for E5 model
-        vec = _embed_text(query, is_query=True)
-
-        # Filter by chunk type if specified
-        valid_indices = []
-        if chunk_type == "all":
-            valid_indices = list(range(len(_chunk_meta)))
+        if results:
+            return results
         else:
-            for i, meta in enumerate(_chunk_meta):
-                if meta["chunk_type"] == chunk_type:
-                    valid_indices.append(i)
-        
-        if not valid_indices:
-            return [{"error": f"No chunks found of type '{chunk_type}'"}]
-
-        # Search in the full index but filter results
-        D, I = _chunk_index.search(vec.astype(np.float32), min(k * 3, len(_chunk_meta)))
-
-        results = []
-        added_count = 0
-        
-        for idx, score in zip(I[0], D[0]):
-            if idx < 0 or added_count >= k:
-                break
-                
-            # Skip if this index is not in our valid set
-            if idx not in valid_indices:
-                continue
-                
-            meta = _chunk_meta[idx]
-            
-            # Build the base result
-            result = {
-                "chunk_id": meta["chunk_id"],
-                "context_id": meta["context_id"],
-                "chunk_type": meta["chunk_type"],
-                "sequence": meta["sequence"],
-                "score": float(score),
-                "file": meta["file"],
-                "procedure": meta["procedure"],
-                "description": meta["description"],
-                "code": meta["code"],
-                "line_start": meta["line_start"],
-                "line_end": meta["line_end"],
-                "file_header": meta["header"],
-                "tags": meta["tags"]
-            }
-            
-            # Add injected context if requested and available
-            if include_context and meta["injected_context"]:
-                result["injected_context"] = meta["injected_context"]
-            
-            # Add navigation information if requested
-            if navigation in ["prev", "next", "both"]:
-                nav_info = {}
-                
-                # Find previous and next chunks in the same context
-                current_context = meta["context_id"]
-                current_sequence = meta["sequence"]
-                
-                if navigation in ["prev", "both"]:
-                    # Find previous chunk
-                    prev_chunk = None
-                    for other_meta in _chunk_meta:
-                        if (other_meta["context_id"] == current_context and 
-                            other_meta["sequence"] == current_sequence - 1):
-                            prev_chunk = {
-                                "chunk_id": other_meta["chunk_id"],
-                                "sequence": other_meta["sequence"],
-                                "description": other_meta["description"]
-                            }
-                            break
-                    nav_info["previous"] = prev_chunk
-                
-                if navigation in ["next", "both"]:
-                    # Find next chunk
-                    next_chunk = None
-                    for other_meta in _chunk_meta:
-                        if (other_meta["context_id"] == current_context and 
-                            other_meta["sequence"] == current_sequence + 1):
-                            next_chunk = {
-                                "chunk_id": other_meta["chunk_id"],
-                                "sequence": other_meta["sequence"],
-                                "description": other_meta["description"]
-                            }
-                            break
-                    nav_info["next"] = next_chunk
-                
-                result["navigation"] = nav_info
-            
-            results.append(result)
-            added_count += 1
-
-        return results
+            return f"No operators found matching '{query}'. Try different keywords or check spelling."
     
     except Exception as e:
-        logging.exception("Error in enhanced_chunk_search: %s", e)
+        logging.exception("Error in search_operators: %s", e)
+        return f"Search failed: {str(e)}"
+
+
+@mcp.tool()
+def search_code(
+    query: Optional[str] = None,
+    chunk_type: str = "all",    # "full", "micro", "all"
+    include_context: bool = True,
+    include_navigation: bool = True,
+    k: int = TOP_K_DEFAULT,
+    chunk_id: Optional[int] = None,  # Direct chunk ID lookup for navigation
+    direction: Optional[str] = None  # "previous" or "next" for navigation
+) -> list[dict]:
+    """Perform semantic code search or navigate by chunk ID.
+
+    Uses pre-built FAISS indices for semantic search, or direct database lookup
+    for chunk ID navigation. Navigation stays within the same file/context.
+
+    Args:
+        query: Natural language search string (min length 3). Ignored if chunk_id provided.
+        chunk_type: Which index to query: "full", "micro", or "all".
+        include_context: For micro chunks, inject surrounding context in results.
+        include_navigation: Include previous/next pointers in returned results.
+        k: Number of top matches to return for semantic search.
+        chunk_id: Direct chunk ID to retrieve (for navigation).
+        direction: Optional "previous" or "next" to get adjacent chunk.
+    """
+    try:
+        # Handle direct chunk ID lookup (navigation mode)
+        if chunk_id is not None:
+            return _get_chunk_by_id(chunk_id, direction, chunk_type, include_context, include_navigation)
+
+        # Handle semantic search
+        if not query or len(query.strip()) < 3:
+            return []
+
+        query = query.strip()
+
+        # Ensure relevant indices are loaded
+        if chunk_type in ("full", "all"):
+            _ensure_full_chunk_index()
+        if chunk_type in ("micro", "all"):
+            _ensure_micro_chunk_index()
+
+        all_results: list[dict] = []
+
+        # Helper to search a specific index
+        def _search_index(index, meta, source_name: str):
+            vec = _embed_text(query, is_query=True)
+            D, I = index.search(vec.astype(np.float32), k)
+            for idx, score in zip(I[0], D[0]):
+                if idx < 0:
+                    continue
+                m = meta[idx]
+                result = _build_chunk_result(m, source_name, float(score), include_context, include_navigation)
+                all_results.append(result)
+
+        if chunk_type in ("full", "all") and _full_chunk_index is not None:
+            _search_index(_full_chunk_index, _full_chunk_meta, "full")
+        if chunk_type in ("micro", "all") and _micro_chunk_index is not None:
+            _search_index(_micro_chunk_index, _micro_chunk_meta, "micro")
+
+        all_results.sort(key=lambda x: x["score"], reverse=True)
+        return all_results[:k]
+
+    except Exception as e:
+        logging.exception("Error in search_code: %s", e)
         return [{"error": f"Search failed: {str(e)}"}]
+
+
+def _get_chunk_by_id(chunk_id: int, direction: Optional[str], chunk_type: str, 
+                     include_context: bool, include_navigation: bool) -> list[dict]:
+    """Get a specific chunk by ID, optionally navigating to adjacent chunk."""
+    with get_chunk_connection() as con:
+        cur = con.cursor()
+        
+        target_chunk_id = chunk_id
+        
+        if direction in ("previous", "next"):
+            # Get current chunk to find its context and sequence
+            current_row = cur.execute(
+                """SELECT c.context_id, c.sequence FROM chunks c WHERE c.id = ?""", 
+                (chunk_id,)
+            ).fetchone()
+            
+            if not current_row:
+                return []
+            
+            context_id = current_row["context_id"]
+            current_sequence = current_row["sequence"]
+            
+            # Find adjacent chunk in same context, regardless of type
+            if direction == "next":
+                adjacent_row = cur.execute(
+                    """SELECT c.id FROM chunks c 
+                       WHERE c.context_id = ? AND c.sequence > ?
+                       ORDER BY c.sequence ASC LIMIT 1""",
+                    (context_id, current_sequence)
+                ).fetchone()
+            else:  # previous
+                adjacent_row = cur.execute(
+                    """SELECT c.id FROM chunks c 
+                       WHERE c.context_id = ? AND c.sequence < ?
+                       ORDER BY c.sequence DESC LIMIT 1""",
+                    (context_id, current_sequence)
+                ).fetchone()
+            
+            if not adjacent_row:
+                return []  # No adjacent chunk in same file
+            
+            target_chunk_id = adjacent_row["id"]
+        
+        # Get the full chunk data
+        chunk_row = cur.execute(
+            """SELECT c.id as chunk_id, c.context_id, c.chunk_type, c.sequence, 
+                      c.description, c.code, c.line_start, c.line_end, c.injected_context,
+                      ctx.file, ctx.procedure, ctx.header, ctx.tags
+               FROM chunks c
+               JOIN contexts ctx ON c.context_id = ctx.id
+               WHERE c.id = ?""",
+            (target_chunk_id,)
+        ).fetchone()
+        
+        if not chunk_row:
+            return []
+        
+        # Build result
+        result = _build_chunk_result(chunk_row, chunk_row["chunk_type"], None, include_context, include_navigation)
+        return [result]
+
+
+def _build_chunk_result(chunk_data, source_name: str, score: Optional[float], 
+                       include_context: bool, include_navigation: bool) -> dict:
+    """Build a standardized chunk result dictionary."""
+    result = {
+        "source": source_name,
+        "score": score,
+        "chunk_id": chunk_data["chunk_id"],
+        "context_id": chunk_data["context_id"],
+        "chunk_type": chunk_data["chunk_type"],
+        "sequence": chunk_data["sequence"],
+        "file": chunk_data["file"],
+        "procedure": chunk_data["procedure"],
+        "description": chunk_data["description"],
+        "code": chunk_data["code"],
+        "line_start": chunk_data["line_start"],
+        "line_end": chunk_data["line_end"],
+        "file_header": chunk_data["header"],
+        "tags": chunk_data["tags"]
+    }
+    
+    # Add injected context for micro chunks
+    if (source_name == "micro" and include_context and 
+        chunk_data.get("injected_context")):
+        result["injected_context"] = chunk_data["injected_context"]
+    
+    # Add navigation info
+    if include_navigation:
+        result["navigation"] = _get_navigation_info(chunk_data)
+    
+    return result
+
+
+def _get_navigation_info(chunk_data) -> dict:
+    """Get navigation info (previous/next chunk IDs) for a chunk with boundary status."""
+    with get_chunk_connection() as con:
+        cur = con.cursor()
+        
+        context_id = chunk_data["context_id"]
+        sequence = chunk_data["sequence"]
+        
+        # Find previous chunk in same context, regardless of type
+        prev_row = cur.execute(
+            """SELECT c.id, c.sequence, c.description 
+               FROM chunks c 
+               WHERE c.context_id = ? AND c.sequence < ?
+               ORDER BY c.sequence DESC LIMIT 1""",
+            (context_id, sequence)
+        ).fetchone()
+        
+        # Find next chunk in same context, regardless of type
+        next_row = cur.execute(
+            """SELECT c.id, c.sequence, c.description 
+               FROM chunks c 
+               WHERE c.context_id = ? AND c.sequence > ?
+               ORDER BY c.sequence ASC LIMIT 1""",
+            (context_id, sequence)
+        ).fetchone()
+        
+        # Check if this is the first or last chunk in the file
+        is_first_chunk = prev_row is None
+        is_last_chunk = next_row is None
+        
+        # Get total chunks in this context for additional context (regardless of type)
+        total_chunks = cur.execute(
+            """SELECT COUNT(*) FROM chunks c 
+               WHERE c.context_id = ?""",
+            (context_id,)
+        ).fetchone()[0]
+        
+        return {
+            "previous": {
+                "chunk_id": prev_row["id"], 
+                "sequence": prev_row["sequence"], 
+                "description": prev_row["description"]
+            } if prev_row else None,
+            "next": {
+                "chunk_id": next_row["id"], 
+                "sequence": next_row["sequence"], 
+                "description": next_row["description"]
+            } if next_row else None,
+            "boundary_status": {
+                "is_first_chunk": is_first_chunk,
+                "is_last_chunk": is_last_chunk,
+                "total_chunks": total_chunks,
+                "current_position": sequence + 1  # 1-based for user display
+            }
+        }
+
+
+
 
 
 if __name__ == "__main__":
@@ -897,8 +621,8 @@ if __name__ == "__main__":
         # Pre-load models and indices to prevent Claude Desktop timeouts
         logging.info("Warming up semantic indices...")
         _ensure_semantic_index()
-        _ensure_code_index()
-        _ensure_chunk_index()
+        _ensure_full_chunk_index()
+        _ensure_micro_chunk_index()
         logging.info("Warmup complete")
         
         logging.info("Launching FastMCP (transport=stdio)…")

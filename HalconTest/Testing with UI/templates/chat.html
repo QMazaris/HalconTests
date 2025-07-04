@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HALCON Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="chat-container">
+        <!-- Search Controls Panel -->
+        <div id="controls-panel">
+            <div class="control-group">
+                <label for="search-type">Search Type:</label>
+                <select id="search-type">
+                    <option value="auto">Auto-detect</option>
+                    <option value="operators">Operators</option>
+                    <option value="code">Code Examples</option>
+                    <option value="both">Both</option>
+                </select>
+            </div>
+            
+            <div class="control-group">
+                <label for="chunk-type">Code Chunk Type:</label>
+                <select id="chunk-type">
+                    <option value="all">All (Full + Micro)</option>
+                    <option value="full">Full Chunks</option>
+                    <option value="micro">Micro Chunks</option>
+                </select>
+            </div>
+            
+            <div class="control-group">
+                <label for="result-count">Results:</label>
+                <select id="result-count">
+                    <option value="3" selected>3</option>
+                    <option value="5">5</option>
+                    <option value="8">8</option>
+                    <option value="10">10</option>
+                </select>
+            </div>
+        </div>
+        
+        <div id="chat-box">
+            <div class="message assistant">
+                <p>Welcome to the HALCON Chat Interface! Use the controls above to customize your search experience:</p>
+                <ul>
+                    <li><strong>Search Type:</strong> Choose between operators, code examples, or both</li>
+                    <li><strong>Chunk Type:</strong> Control the size of code results (full vs micro chunks)</li>
+                    <li><strong>Navigation:</strong> Use ← → arrow keys to browse through code chunks</li>
+                </ul>
+                <p>Try searching for "edge detection" or "read image"!</p>
+            </div>
+        </div>
+        <form id="chat-form">
+            <input type="text" id="user-input" placeholder="Type your message..." autocomplete="off">
+            <button type="submit">Send</button>
+        </form>
+    </div>
+    <script>
+        let lastSearchResults = null;
+        let currentNavigationContext = null;
+        let activeNavigationItems = [];
+        let currentNavItem = null; // Active navigation target
+
+        // Send message function
+        async function sendMessage(message, isNavigation = false, navigationData = null) {
+            const chatBox = document.getElementById('chat-box');
+
+            if (!isNavigation) {
+                // Display user message for regular searches
+                const userMessageDiv = document.createElement('div');
+                userMessageDiv.classList.add('message', 'user');
+                userMessageDiv.innerHTML = `<p>${message}</p>`;
+                chatBox.appendChild(userMessageDiv);
+                
+                document.getElementById('user-input').value = '';
+            }
+
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            // Display loading indicator
+            const loadingDiv = document.createElement('div');
+            loadingDiv.classList.add('message', 'assistant', 'loading');
+            loadingDiv.innerHTML = `<p><span>.</span><span>.</span><span>.</span></p>`;
+            chatBox.appendChild(loadingDiv);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            try {
+                // Prepare request data
+                const requestData = { message: message };
+                
+                if (!isNavigation) {
+                    // Add search controls for regular searches
+                    requestData.search_type = document.getElementById('search-type').value;
+                    requestData.chunk_type = document.getElementById('chunk-type').value;
+                    requestData.result_count = parseInt(document.getElementById('result-count').value);
+                } else {
+                    // Add navigation data
+                    requestData.navigation = navigationData.direction;
+                    requestData.navigation_chunk_id = navigationData.chunk_id;
+                    requestData.search_type = 'code'; // Navigation only works for code
+                    requestData.chunk_type = navigationData.chunk_type;
+                }
+
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestData)
+                });
+
+                chatBox.removeChild(loadingDiv);
+
+                if (!response.ok) {
+                    throw new Error('Network response was not ok.');
+                }
+
+                const data = await response.json();
+                
+                // Display assistant response
+                const assistantMessageDiv = document.createElement('div');
+                assistantMessageDiv.classList.add('message', 'assistant');
+                assistantMessageDiv.innerHTML = data.response;
+                
+                // Add navigation indicators if this is a code result
+                if (data.navigation_data && data.navigation_data.length > 0) {
+                    addNavigationIndicators(assistantMessageDiv, data.navigation_data);
+                    // Store navigation data & set active item to first result
+                    activeNavigationItems = data.navigation_data;
+                    
+                    if (isNavigation) {
+                        // For navigation responses, update currentNavItem to the new chunk
+                        currentNavItem = data.navigation_data[0];
+                        updateNavigationHighlights();
+                    } else {
+                        // For search responses, set first result as active
+                        currentNavItem = data.navigation_data[0];
+                    }
+                } else {
+                    activeNavigationItems = [];
+                    currentNavItem = null;
+                }
+                
+                chatBox.appendChild(assistantMessageDiv);
+                chatBox.scrollTop = chatBox.scrollHeight;
+
+                // Store results for navigation
+                if (data.navigation_data) {
+                    lastSearchResults = data.navigation_data;
+                }
+
+            } catch (error) {
+                console.error('Error:', error);
+                chatBox.removeChild(loadingDiv);
+                const errorMessageDiv = document.createElement('div');
+                errorMessageDiv.classList.add('message', 'assistant', 'error');
+                errorMessageDiv.innerHTML = `<p>Sorry, an error occurred: ${error.message}</p>`;
+                chatBox.appendChild(errorMessageDiv);
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
+        }
+
+        // Add navigation indicators to code results
+        function addNavigationIndicators(messageDiv, navigationData) {
+            navigationData.forEach((result, index) => {
+                if (result.navigation) {
+                    const navDiv = document.createElement('div');
+                    navDiv.className = 'navigation-indicator' + (index === 0 ? ' current-nav' : ''); // highlight first
+                    navDiv.setAttribute('data-chunk-id', result.chunk_id);
+                    navDiv.setAttribute('data-chunk-type', result.chunk_type);
+                    navDiv.setAttribute('data-sequence', result.sequence);
+                    navDiv.setAttribute('data-file', result.file || '');
+                    navDiv.title = `Click to activate navigation for ${result.file || 'code block'} (Chunk ID: ${result.chunk_id})`;
+                    
+                    const leftArrow = document.createElement('span');
+                    leftArrow.className = result.navigation.previous ? 'nav-arrow active' : 'nav-arrow disabled';
+                    leftArrow.innerHTML = '←';
+                    leftArrow.title = result.navigation.previous ? 
+                        `Previous: ${result.navigation.previous.description || 'Chunk ' + result.navigation.previous.sequence}` : 
+                        'No previous chunk';
+                    
+                    const infoSpan = document.createElement('span');
+                    infoSpan.className = 'nav-info';
+                    infoSpan.innerHTML = `Sequence ${result.sequence} | Chunk ID: ${result.chunk_id} | Use ← → arrow keys to navigate`;
+                    
+                    const rightArrow = document.createElement('span');
+                    rightArrow.className = result.navigation.next ? 'nav-arrow active' : 'nav-arrow disabled';
+                    rightArrow.innerHTML = '→';
+                    rightArrow.title = result.navigation.next ? 
+                        `Next: ${result.navigation.next.description || 'Chunk ' + result.navigation.next.sequence}` : 
+                        'No next chunk';
+                    
+                    navDiv.appendChild(leftArrow);
+                    navDiv.appendChild(infoSpan);
+                    navDiv.appendChild(rightArrow);
+                    
+                    // Add click handler to make this navigation indicator active
+                    navDiv.addEventListener('click', function() {
+                        setActiveNavigationTarget(result);
+                        updateNavigationHighlights();
+                    });
+                    
+                    // Insert navigation indicator after the code block
+                    const codeBlocks = messageDiv.querySelectorAll('pre');
+                    if (codeBlocks.length > index) {
+                        codeBlocks[index].parentNode.insertBefore(navDiv, codeBlocks[index].nextSibling);
+                    } else {
+                        messageDiv.appendChild(navDiv);
+                    }
+                }
+            });
+        }
+
+        // Set active navigation target
+        function setActiveNavigationTarget(result) {
+            currentNavItem = result;
+            console.log(`Active navigation set to chunk ID: ${result.chunk_id}, sequence: ${result.sequence}`);
+        }
+
+        // Update visual highlighting for active navigation
+        function updateNavigationHighlights() {
+            // Remove current-nav class from all indicators
+            document.querySelectorAll('.navigation-indicator').forEach(indicator => {
+                indicator.classList.remove('current-nav');
+            });
+            
+            // Add current-nav class to the active indicator
+            if (currentNavItem) {
+                const activeIndicator = document.querySelector(`[data-chunk-id="${currentNavItem.chunk_id}"]`);
+                if (activeIndicator) {
+                    activeIndicator.classList.add('current-nav');
+                }
+            }
+        }
+
+        // Navigate to previous/next chunk
+        function navigateChunk(direction, chunkId, chunkType) {
+            // Validate inputs before making the request
+            if (!direction || !chunkId || !chunkType) {
+                console.error('Invalid navigation parameters:', { direction, chunkId, chunkType });
+                console.error('Types:', typeof direction, typeof chunkId, typeof chunkType);
+                return;
+            }
+            
+            console.log(`Requesting navigation: ${direction}, chunk_id: ${chunkId} (type: ${typeof chunkId}), chunk_type: ${chunkType}`);
+            
+            sendMessage('', true, {
+                direction: direction,
+                chunk_id: parseInt(chunkId), // Ensure it's an integer
+                chunk_type: chunkType
+            });
+        }
+
+        // Keyboard navigation handler
+        function handleKeyNavigation(event) {
+            // Only handle arrow keys when not typing in input field
+            if (event.target === document.getElementById('user-input')) return;
+            
+            // Ensure we have a valid current navigation item
+            if (!currentNavItem || !currentNavItem.navigation) {
+                console.log('No valid currentNavItem for navigation:', currentNavItem);
+                return;
+            }
+            
+            let shouldNavigate = false;
+            let direction = null;
+            
+            if (event.key === 'ArrowLeft') {
+                if (currentNavItem.navigation.previous) {
+                    event.preventDefault();
+                    direction = 'previous';
+                    shouldNavigate = true;
+                }
+            } else if (event.key === 'ArrowRight') {
+                if (currentNavItem.navigation.next) {
+                    event.preventDefault();
+                    direction = 'next';
+                    shouldNavigate = true;
+                }
+            }
+            
+            if (shouldNavigate && direction) {
+                console.log(`Navigating ${direction} from chunk ID: ${currentNavItem.chunk_id} (type: ${typeof currentNavItem.chunk_id})`);
+                console.log('Full currentNavItem:', currentNavItem);
+                navigateChunk(direction, currentNavItem.chunk_id, currentNavItem.chunk_type);
+            }
+        }
+
+        // Form submission handler
+        document.getElementById('chat-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const message = document.getElementById('user-input').value.trim();
+            if (!message) return;
+            
+            // Clear navigation context on new search
+            activeNavigationItems = [];
+            currentNavItem = null;
+            sendMessage(message);
+        });
+
+        // Auto-resize controls when search type changes
+        document.getElementById('search-type').addEventListener('change', function() {
+            const chunkTypeGroup = document.querySelector('#chunk-type').parentNode;
+            if (this.value === 'operators') {
+                chunkTypeGroup.style.opacity = '0.5';
+                chunkTypeGroup.style.pointerEvents = 'none';
+            } else {
+                chunkTypeGroup.style.opacity = '1';
+                chunkTypeGroup.style.pointerEvents = 'auto';
+            }
+        });
+
+        // Add keyboard event listener
+        document.addEventListener('keydown', handleKeyNavigation);
+
+        // Focus management - ensure chat container can receive focus for keyboard events
+        document.getElementById('chat-container').setAttribute('tabindex', '0');
+    </script>
+</body>
+</html> 

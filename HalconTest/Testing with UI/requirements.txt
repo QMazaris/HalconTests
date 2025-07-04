@@ -1,0 +1,6 @@
+flask>=2.0
+markdown
+sentence-transformers
+faiss-cpu
+numpy
+mcp 
