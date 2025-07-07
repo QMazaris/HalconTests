@@ -42,7 +42,7 @@ NPROBE = 16
 
 # How many extra candidates to pull from FAISS before filtering/deduping.
 # e.g. factor 5 means we fetch up to k*5 results per index.
-EXTRA_RESULTS_FACTOR = 5
+EXTRA_RESULTS_FACTOR = 10
 
 # Boost that is added to the semantic similarity score if the exact query
 # token is found as a whole word inside the code snippet. Helps single-operator
@@ -536,11 +536,16 @@ def search_code(
             return []
 
         query = query.strip()
+        # Log the incoming search query and parameters
+        logging.info("[search_code] query='%s', chunk_type=%s, k=%d", query, chunk_type, k)
 
         tokens = re.findall(r"\w+", query.lower())
         operator_set = _ensure_operator_name_set()
         operator_tokens = [t for t in tokens if t in operator_set]
         has_operator_in_query = bool(operator_tokens)
+
+        if has_operator_in_query:
+            logging.info("[search_code] Detected operator tokens: %s", ", ".join(operator_tokens))
 
         # Ensure relevant indices are loaded
         if chunk_type in ("full", "all"):
@@ -550,24 +555,51 @@ def search_code(
 
         all_results: list[dict] = []
 
+        # Track statistics
+        total_exact_matches: int = 0  # how many results added via SQL fallback
+        total_raw_semantic: int = 0   # hits returned directly from FAISS before filtering
+        total_filtered_semantic: int = 0  # hits kept after operator filtering
+
         # Pre-compile patterns that must appear in the code if operator detected
         op_patterns = [re.compile(r"\b" + re.escape(tok) + r"\b", re.IGNORECASE) for tok in operator_tokens]
 
         # Helper to search a specific index
         def _search_index(index, meta, source_name: str):
+            nonlocal total_raw_semantic, total_filtered_semantic
+
             vec = _embed_text(query, is_query=True)
             fetch_k = min(len(meta), k * EXTRA_RESULTS_FACTOR)
             D, I = index.search(vec.astype(np.float32), fetch_k)
+
             for idx, score in zip(I[0], D[0]):
                 if idx < 0:
                     continue
+
+                total_raw_semantic += 1  # Count every valid FAISS hit
+
                 m = meta[idx]
 
-                # Keep only chunks that match at least one operator token when operator detected
+                # Prepare texts for operator presence check
                 code_text = m.get("code", "") if isinstance(m, dict) else m["code"]
+                injected_context_text = ""
+                if source_name == "micro":
+                    injected_context_text = (
+                        m.get("injected_context", "") if isinstance(m, dict) else m.get("injected_context", "")
+                    ) or ""
+
+                # Determine if we keep based on operator tokens (when present)
+                keep = True
                 if has_operator_in_query:
-                    if not any(p.search(code_text) for p in op_patterns):
-                        continue  # skip, operator not present
+                    has_in_code = any(p.search(code_text) for p in op_patterns)
+                    has_in_context = (
+                        source_name == "micro" and injected_context_text and any(p.search(injected_context_text) for p in op_patterns)
+                    )
+                    keep = has_in_code or has_in_context
+
+                if not keep:
+                    continue  # filter out
+
+                total_filtered_semantic += 1
 
                 result = _build_chunk_result(m, source_name, float(score), include_context, include_navigation)
                 all_results.append(result)
@@ -577,20 +609,38 @@ def search_code(
         if chunk_type in ("micro", "all") and _micro_chunk_index is not None:
             _search_index(_micro_chunk_index, _micro_chunk_meta, "micro")
 
+        # Log semantic retrieval statistics before SQL fallback
+        logging.info(
+            "[search_code] Semantic hits: %d raw, %d after exact-match filtering",
+            total_raw_semantic,
+            total_filtered_semantic,
+        )
+
         # If operators are in the query and no semantic hit contains any of them,
         # pull chunks directly via SQL LIKE for each operator token.
         if has_operator_in_query and not any(any(p.search(r.get("code", "")) for p in op_patterns) for r in all_results):
             for tok in operator_tokens:
-                all_results.extend(
-                    _exact_match_chunks(tok, chunk_type, include_context, include_navigation, k)
-                )
+                exact_matches = _exact_match_chunks(tok, chunk_type, include_context, include_navigation, k)
+                total_exact_matches += len(exact_matches)
+                all_results.extend(exact_matches)
+
+        if total_exact_matches:
+            logging.info("[search_code] Exact-match fallback added %d results", total_exact_matches)
 
         all_results.sort(key=lambda x: x["score"], reverse=True)
+
         # Dedupe adjacent micro chunks (same context, neighbouring sequence)
+        len_before_dedupe = len(all_results)
         all_results = _dedupe_adjacent_micro_results(all_results)
+        len_after_dedupe = len(all_results)
+
+        if len_after_dedupe < len_before_dedupe:
+            logging.info("[search_code] Deduped adjacent micro chunks: removed %d duplicates", len_before_dedupe - len_after_dedupe)
 
         # Ensure we return at most k results.
-        return all_results[:k]
+        final_results = all_results[:k]
+        logging.info("[search_code] Returning %d results", len(final_results))
+        return final_results
 
     except Exception as e:
         logging.exception("Error in search_code: %s", e)
