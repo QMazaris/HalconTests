@@ -43,12 +43,7 @@
         <div id="chat-box">
             <div class="message assistant">
                 <p>Welcome to the HALCON Chat Interface! Use the controls above to customize your search experience:</p>
-                <ul>
-                    <li><strong>Search Type:</strong> Choose between operators, code examples, or both</li>
-                    <li><strong>Chunk Type:</strong> Control the size of code results (full vs micro chunks)</li>
-                    <li><strong>Navigation:</strong> Use ← → arrow keys to browse through code chunks</li>
-                </ul>
-                <p>Try searching for "edge detection" or "read image"!</p>
+                <p>Type your query below. Use <code>/c</code> or <code>/o</code> at the start to quickly switch to <em>Code</em> or <em>Operator</em> search.</p>
             </div>
         </div>
         <form id="chat-form">
@@ -66,24 +61,43 @@
         async function sendMessage(message, isNavigation = false, navigationData = null) {
             const chatBox = document.getElementById('chat-box');
 
+            // Quick prefix parsing (/c or /o) for search type override
             if (!isNavigation) {
-                // Display user message for regular searches
+                const prefixMatch = message.match(/^\/(c|o)\s+/i);
+                if (prefixMatch) {
+                    const prefix = prefixMatch[1].toLowerCase();
+                    if (prefix === 'c') {
+                        document.getElementById('search-type').value = 'code';
+                    } else if (prefix === 'o') {
+                        document.getElementById('search-type').value = 'operators';
+                    }
+                    message = message.replace(/^\/(c|o)\s+/i, '').trim();
+                    if (!message) {
+                        return; // empty after removing prefix
+                    }
+                }
+            }
+
+            if (!isNavigation) {
                 const userMessageDiv = document.createElement('div');
                 userMessageDiv.classList.add('message', 'user');
                 userMessageDiv.innerHTML = `<p>${message}</p>`;
                 chatBox.appendChild(userMessageDiv);
-                
                 document.getElementById('user-input').value = '';
             }
 
-            chatBox.scrollTop = chatBox.scrollHeight;
+            if (isNavigation) {
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
 
             // Display loading indicator
             const loadingDiv = document.createElement('div');
             loadingDiv.classList.add('message', 'assistant', 'loading');
             loadingDiv.innerHTML = `<p><span>.</span><span>.</span><span>.</span></p>`;
             chatBox.appendChild(loadingDiv);
-            chatBox.scrollTop = chatBox.scrollHeight;
+            if (isNavigation) {
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
 
             try {
                 // Prepare request data
@@ -143,7 +157,9 @@
                 }
                 
                 chatBox.appendChild(assistantMessageDiv);
-                chatBox.scrollTop = chatBox.scrollHeight;
+                if (isNavigation) {
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
 
                 // Store results for navigation
                 if (data.navigation_data) {
@@ -157,7 +173,9 @@
                 errorMessageDiv.classList.add('message', 'assistant', 'error');
                 errorMessageDiv.innerHTML = `<p>Sorry, an error occurred: ${error.message}</p>`;
                 chatBox.appendChild(errorMessageDiv);
-                chatBox.scrollTop = chatBox.scrollHeight;
+                if (isNavigation) {
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
             }
         }
 

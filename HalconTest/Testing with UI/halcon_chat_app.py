@@ -160,7 +160,7 @@ def process_query(query, search_type="auto", chunk_type="all", result_count=3, n
                     if result.get('navigation'):
                         navigation_data.append(result)
                 
-                response += f"*💡 Tip: Use the controls above to switch to operators or adjust chunk type*"
+                # Removed verbose tip line for cleaner output
                 return response, navigation_data
             else:
                 return "I couldn't find any code examples matching your query. Try different keywords or switch to operators search.", []
@@ -212,7 +212,7 @@ def process_query(query, search_type="auto", chunk_type="all", result_count=3, n
             if not has_operator_results and not has_code_results:
                 response += "No results found in either operators or code examples."
             
-            response += "\n---\n*💡 Tip: Use the search type controls to focus your search*"
+            # Removed verbose tip line
             return response, navigation_data
         
         else:  # operators search
@@ -228,14 +228,14 @@ def process_query(query, search_type="auto", chunk_type="all", result_count=3, n
             elif isinstance(results, dict):
                 response = "🔍 **Operators Search** (Exact Match)\n\nFound exact operator match:\n\n"
                 response += format_operator_result(results) + "\n\n"
-                response += "*💡 Tip: Switch to 'Code Examples' to see implementation examples*"
+                # Tip removed
                 return response, []
             elif isinstance(results, list) and results:
                 response = f"🔍 **Operators Search**\n\nHere are the top {len(results)} relevant HALCON operators:\n\n"
                 for i, result in enumerate(results, 1):
                     response += f"## {i}. {result.get('name', 'Operator')}\n\n"
                     response += format_operator_result(result) + "\n\n---\n\n"
-                response += "*💡 Tip: Switch to 'Code Examples' to see implementation examples*"
+                # Tip removed
                 return response, []
             else:
                 return "I couldn't find any operators matching your query. Try different keywords or switch to code examples.", []

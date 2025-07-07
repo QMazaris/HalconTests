@@ -325,7 +325,7 @@ def _ensure_micro_chunk_index() -> None:
 
 @mcp.resource("halcon://operators")
 def get_operators_info() -> str:
-    """Get a summary of the HALCON knowledge base, including operator, code example, and chunk counts."""
+    """Return a one-line summary of the loaded HALCON knowledge base (operator & chunk counts)."""
     with get_connection() as con:
         op_count = con.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
 
@@ -351,7 +351,15 @@ def search_operators(
     fields: list[str] = ["name", "signature", "description", "url"],
     k: int = TOP_K_DEFAULT
 ) -> Union[dict, list[dict], str]:
-    """Unified HALCON operator search: single-word exact-first, multi-word semantic-only."""
+    """HALCON operator search. Single-token ⇒ exact match, multi-token ⇒ semantic search.
+    
+    Parameters:
+    - query: Operator name or description (min 2 chars)
+    - fields: Data to return ["name", "signature", "description", "parameters", "results", "url"] or "all"
+    - k: Max results for semantic search (ignored for exact matches)
+    
+    Returns dict (exact match), list[dict] (semantic results), or error string.
+    """
     try:
         if not query or len(query.strip()) < 2:
             return "Query too short. Please provide at least 2 characters."
@@ -512,19 +520,17 @@ def search_code(
     chunk_id: Optional[int] = None,  # Direct chunk ID lookup for navigation
     direction: Optional[str] = None  # "previous" or "next" for navigation
 ) -> list[dict]:
-    """Perform semantic code search or navigate by chunk ID.
+    """Semantic code search & chunk navigation.
 
-    Uses pre-built FAISS indices for semantic search, or direct database lookup
-    for chunk ID navigation. Navigation stays within the same file/context.
+    Query mode: Embeds query → searches FAISS indices → returns ranked code chunks.
+    - chunk_type: "full" (complete procedures), "micro" (small snippets), or "all"
+    - Auto-detects HALCON operators in query for enhanced filtering
+    - include_context: Injects surrounding code for micro chunks
 
-    Args:
-        query: Natural language search string (min length 3). Ignored if chunk_id provided.
-        chunk_type: Which index to query: "full", "micro", or "all".
-        include_context: For micro chunks, inject surrounding context in results.
-        include_navigation: Include previous/next pointers in returned results.
-        k: Number of top matches to return for semantic search.
-        chunk_id: Direct chunk ID to retrieve (for navigation).
-        direction: Optional "previous" or "next" to get adjacent chunk.
+    Navigation mode: Direct chunk retrieval by ID.
+    - chunk_id: Specific chunk to fetch
+    - direction: "previous"/"next" to get adjacent chunk in same file
+    - Always includes navigation metadata for browsing between chunks
     """
     try:
         # Handle direct chunk ID lookup (navigation mode)
