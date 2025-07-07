@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from typing import Optional, Union
 import logging
+import re
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -38,6 +39,28 @@ TOP_K_DEFAULT = 5
 USE_QUANTIZATION = True
 QUANTIZATION_BITS = 8
 NPROBE = 16
+
+# How many extra candidates to pull from FAISS before filtering/deduping.
+# e.g. factor 5 means we fetch up to k*5 results per index.
+EXTRA_RESULTS_FACTOR = 5
+
+# Boost that is added to the semantic similarity score if the exact query
+# token is found as a whole word inside the code snippet. Helps single-operator
+# queries (e.g. "read_dl_model") surface direct hits.
+KEYWORD_BOOST = 5.0
+
+# Cached set of all HALCON operator names (lower-case)
+_operator_names: set[str] | None = None
+
+
+def _ensure_operator_name_set() -> set[str]:
+    """Load and cache the set of HALCON operator names from the operators table."""
+    global _operator_names
+    if _operator_names is None:
+        with get_connection() as con:
+            rows = con.execute("SELECT name FROM operators").fetchall()
+        _operator_names = {r[0].lower() for r in rows}
+    return _operator_names
 
 # Create the FastMCP server
 mcp = FastMCP("halcon-mcp-server")
@@ -393,6 +416,92 @@ def search_operators(
         return f"Search failed: {str(e)}"
 
 
+def _dedupe_adjacent_micro_results(results: list[dict]) -> list[dict]:
+    """Remove near-duplicate micro-chunk hits that originate from adjacent
+    parts of the same file.
+
+    If two micro chunks come from the same ``context_id`` (i.e. file) and their
+    ``sequence`` numbers differ by 1 (direct neighbours), only the first (highest
+    scored) occurrence will be kept. This reduces visual clutter in the top-k
+    results while still allowing navigation via the *next/previous* links.
+    """
+    deduped: list[dict] = []
+    # Map context_id -> list of already kept sequence numbers
+    seen_sequences: dict[int, list[int]] = {}
+
+    for res in results:
+        # Only dedupe micro chunks; keep other chunk types untouched
+        if res.get("chunk_type") != "micro":
+            deduped.append(res)
+            continue
+
+        ctx_id = res.get("context_id")
+        seq = res.get("sequence")
+        if ctx_id is None or seq is None:
+            # Should not happen, but keep defensive
+            deduped.append(res)
+            continue
+
+        # Skip if a neighbouring sequence (±1) from the same context was kept
+        if ctx_id in seen_sequences and any(abs(seq - s) <= 1 for s in seen_sequences[ctx_id]):
+            continue  # near-duplicate → drop
+
+        deduped.append(res)
+        seen_sequences.setdefault(ctx_id, []).append(seq)
+
+    return deduped
+
+
+# --- Exact token fallback ----------------------------------------------------
+
+def _exact_match_chunks(token: str, chunk_type_filter: str, include_context: bool,
+                       include_navigation: bool, limit: int = 10) -> list[dict]:
+    """Return chunks whose *code* field contains the exact token (case-insensitive).
+
+    For operator-like single-word queries we run a cheap SQL LIKE search
+    directly on the SQLite chunks table. This acts as a safety net when the
+    semantic model fails to surface a relevant snippet.
+    """
+    if not CHUNK_DB_PATH.exists():
+        return []
+
+    token_like = f"%{token}%"
+    rows: list[sqlite3.Row] = []
+    with get_chunk_connection() as con:
+        cur = con.cursor()
+
+        if chunk_type_filter in ("full", "micro"):
+            cur.execute(
+                """SELECT c.id as chunk_id, c.context_id, c.chunk_type, c.sequence, c.description, c.code,
+                          c.line_start, c.line_end, c.injected_context,
+                          ctx.file, ctx.procedure, ctx.header, ctx.tags
+                   FROM chunks c JOIN contexts ctx ON c.context_id = ctx.id
+                   WHERE c.chunk_type = ? AND LOWER(c.code) LIKE LOWER(?)
+                   LIMIT ?""",
+                (chunk_type_filter, token_like, limit),
+            )
+        else:  # 'all'
+            cur.execute(
+                """SELECT c.id as chunk_id, c.context_id, c.chunk_type, c.sequence, c.description, c.code,
+                          c.line_start, c.line_end, c.injected_context,
+                          ctx.file, ctx.procedure, ctx.header, ctx.tags
+                   FROM chunks c JOIN contexts ctx ON c.context_id = ctx.id
+                   WHERE LOWER(c.code) LIKE LOWER(?)
+                   LIMIT ?""",
+                (token_like, limit),
+            )
+        rows = cur.fetchall()
+
+    # Build results with a high artificial score so they bubble to the top
+    results = [
+        _build_chunk_result(r, r["chunk_type"], KEYWORD_BOOST + 50.0, include_context, include_navigation)
+        for r in rows
+    ]
+    for r in results:
+        r["exact_match"] = True
+    return results
+
+
 @mcp.tool()
 def search_code(
     query: Optional[str] = None,
@@ -428,6 +537,11 @@ def search_code(
 
         query = query.strip()
 
+        tokens = re.findall(r"\w+", query.lower())
+        operator_set = _ensure_operator_name_set()
+        operator_tokens = [t for t in tokens if t in operator_set]
+        has_operator_in_query = bool(operator_tokens)
+
         # Ensure relevant indices are loaded
         if chunk_type in ("full", "all"):
             _ensure_full_chunk_index()
@@ -436,14 +550,25 @@ def search_code(
 
         all_results: list[dict] = []
 
+        # Pre-compile patterns that must appear in the code if operator detected
+        op_patterns = [re.compile(r"\b" + re.escape(tok) + r"\b", re.IGNORECASE) for tok in operator_tokens]
+
         # Helper to search a specific index
         def _search_index(index, meta, source_name: str):
             vec = _embed_text(query, is_query=True)
-            D, I = index.search(vec.astype(np.float32), k)
+            fetch_k = min(len(meta), k * EXTRA_RESULTS_FACTOR)
+            D, I = index.search(vec.astype(np.float32), fetch_k)
             for idx, score in zip(I[0], D[0]):
                 if idx < 0:
                     continue
                 m = meta[idx]
+
+                # Keep only chunks that match at least one operator token when operator detected
+                code_text = m.get("code", "") if isinstance(m, dict) else m["code"]
+                if has_operator_in_query:
+                    if not any(p.search(code_text) for p in op_patterns):
+                        continue  # skip, operator not present
+
                 result = _build_chunk_result(m, source_name, float(score), include_context, include_navigation)
                 all_results.append(result)
 
@@ -452,7 +577,19 @@ def search_code(
         if chunk_type in ("micro", "all") and _micro_chunk_index is not None:
             _search_index(_micro_chunk_index, _micro_chunk_meta, "micro")
 
+        # If operators are in the query and no semantic hit contains any of them,
+        # pull chunks directly via SQL LIKE for each operator token.
+        if has_operator_in_query and not any(any(p.search(r.get("code", "")) for p in op_patterns) for r in all_results):
+            for tok in operator_tokens:
+                all_results.extend(
+                    _exact_match_chunks(tok, chunk_type, include_context, include_navigation, k)
+                )
+
         all_results.sort(key=lambda x: x["score"], reverse=True)
+        # Dedupe adjacent micro chunks (same context, neighbouring sequence)
+        all_results = _dedupe_adjacent_micro_results(all_results)
+
+        # Ensure we return at most k results.
         return all_results[:k]
 
     except Exception as e:
