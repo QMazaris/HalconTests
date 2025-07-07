@@ -543,7 +543,7 @@ def _build_chunk_result(chunk_data, source_name: str, score: Optional[float],
     
     # Add injected context for micro chunks
     if (source_name == "micro" and include_context and 
-        chunk_data.get("injected_context")):
+        "injected_context" in chunk_data.keys() and chunk_data["injected_context"]):
         result["injected_context"] = chunk_data["injected_context"]
     
     # Add navigation info
